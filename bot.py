@@ -19,12 +19,17 @@ TOKEN = os.getenv("BOT_TOKEN")
 BOT_USERNAME = "quizerrsbot"
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Temporary memory per user (before saving quiz)
 temp_uploads = {}
-
-# Active quiz sessions
 user_sessions = {}
-# user_id -> {"quiz_id": str, "index": int, "score": int, "chat_id": int, "questions": list}
+# user_id -> {
+#   "quiz_id": str,
+#   "index": int,
+#   "score": int,
+#   "chat_id": int,
+#   "questions": list,
+#   "waiting_for_timer": bool,
+#   "time_per_question": int
+# }
 
 
 # -------------------- DATABASE --------------------
@@ -96,7 +101,6 @@ def parse_docx(file_path):
 
     full_text = "\n".join(lines)
 
-    # split by ---
     blocks = re.split(r"\n\s*---\s*\n", full_text)
 
     questions = []
@@ -159,7 +163,6 @@ def parse_docx(file_path):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
 
-    # If started with a quiz link
     if args:
         quiz_id = args[0].strip()
 
@@ -182,10 +185,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        "👋 Welcome!\n\n"
-        "📌 Send me a DOCX file containing your quiz questions.\n"
-        "Then I will ask you for the Quiz Name.\n\n"
-        "After saving, I will generate a share link 🔗"
+        "Welcome!\n"
+        "Send me a DOCX file containing your quiz questions."
     )
 
 
@@ -217,8 +218,8 @@ async def handle_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
 
     await update.message.reply_text(
-        f"✅ File received!\n📌 Questions extracted: {len(questions)}\n\n"
-        "📝 Now send me the Quiz Name (example: Chapter 3 - Blood)."
+        f"✅ File received!\nQuestions extracted: {len(questions)}\n\n"
+        "📝 Now send me the Quiz Name."
     )
 
 
@@ -268,10 +269,40 @@ async def start_quiz_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "index": 0,
         "score": 0,
         "chat_id": chat_id,
-        "questions": questions
+        "questions": questions,
+        "waiting_for_timer": True,
+        "time_per_question": 30
     }
 
-    await query.message.reply_text("✅ Starting your quiz now...")
+    await query.message.reply_text("⏱️ Enter time per question in seconds (5 - 600):")
+
+
+async def handle_timer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    session = user_sessions.get(user_id)
+    if not session:
+        return
+
+    if not session.get("waiting_for_timer"):
+        return
+
+    text = update.message.text.strip()
+
+    if not text.isdigit():
+        await update.message.reply_text("❌ Please enter a number between 5 and 600.")
+        return
+
+    seconds = int(text)
+
+    if seconds < 5 or seconds > 600:
+        await update.message.reply_text("❌ Time must be between 5 and 600 seconds.")
+        return
+
+    session["time_per_question"] = seconds
+    session["waiting_for_timer"] = False
+
+    await update.message.reply_text(f"✅ Timer set: {seconds} seconds per question.\nStarting now...")
 
     await send_next_question(user_id, context)
 
@@ -284,6 +315,7 @@ async def send_next_question(user_id: int, context: ContextTypes.DEFAULT_TYPE):
     idx = session["index"]
     questions = session["questions"]
     chat_id = session["chat_id"]
+    time_per_question = session.get("time_per_question", 30)
 
     if idx >= len(questions):
         score = session["score"]
@@ -307,7 +339,8 @@ async def send_next_question(user_id: int, context: ContextTypes.DEFAULT_TYPE):
         type="quiz",
         correct_option_id=q["correct"],
         explanation=f"💡 {q['explanation']}",
-        is_anonymous=False
+        is_anonymous=False,
+        open_period=time_per_question
     )
 
     session["index"] += 1
@@ -350,16 +383,15 @@ def main():
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-
     app.add_handler(MessageHandler(filters.Document.ALL, handle_doc))
 
-    # Quiz name handler (only after upload)
+    # Timer handler MUST come before quiz name handler
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_timer))
+
+    # Quiz name handler
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_quiz_name))
 
-    # Start quiz button handler
     app.add_handler(CallbackQueryHandler(start_quiz_button, pattern=r"^STARTQUIZ\|"))
-
-    # Correct handler for poll answers
     app.add_handler(PollAnswerHandler(poll_answer))
 
     print("Bot is running...")
