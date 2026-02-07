@@ -1,20 +1,84 @@
 import os
 import re
+import json
+import uuid
+import psycopg2
 from docx import Document
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     ContextTypes,
     filters,
-    PollAnswerHandler
+    CallbackQueryHandler
 )
 
 TOKEN = os.getenv("BOT_TOKEN")
+BOT_USERNAME = "quizerrsbot"
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-user_quiz_data = {}
+temp_uploads = {}
+user_sessions = {}
 
+
+# -------------------- DATABASE --------------------
+
+def get_db_connection():
+    return psycopg2.connect(DATABASE_URL)
+
+
+def init_db():
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS quizzes (
+        quiz_id TEXT PRIMARY KEY,
+        quiz_name TEXT NOT NULL,
+        questions_json TEXT NOT NULL
+    )
+    """)
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def save_quiz_to_db(quiz_id, quiz_name, questions):
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    cur.execute(
+        "INSERT INTO quizzes (quiz_id, quiz_name, questions_json) VALUES (%s, %s, %s)",
+        (quiz_id, quiz_name, json.dumps(questions, ensure_ascii=False))
+    )
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def load_quiz_from_db(quiz_id):
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    cur.execute("SELECT quiz_name, questions_json FROM quizzes WHERE quiz_id = %s", (quiz_id,))
+    row = cur.fetchone()
+
+    cur.close()
+    conn.close()
+
+    if not row:
+        return None
+
+    quiz_name, questions_json = row
+    questions = json.loads(questions_json)
+
+    return {"quiz_name": quiz_name, "questions": questions}
+
+
+# -------------------- DOCX PARSER --------------------
 
 def parse_docx(file_path):
     doc = Document(file_path)
@@ -55,6 +119,7 @@ def parse_docx(file_path):
         if tf_match:
             options = ["True", "False"]
             correct = 0 if answer_raw.lower() == "true" else 1
+
         else:
             options = []
             for letter in ["A", "B", "C", "D"]:
@@ -83,39 +148,138 @@ def parse_docx(file_path):
     return questions
 
 
+# -------------------- BOT HANDLERS --------------------
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+
+    if args:
+        quiz_id = args[0].strip()
+
+        quiz_data = load_quiz_from_db(quiz_id)
+        if not quiz_data:
+            await update.message.reply_text("❌ Quiz not found. The link may be invalid.")
+            return
+
+        quiz_name = quiz_data["quiz_name"]
+
+        keyboard = [
+            [InlineKeyboardButton("▶️ Start your quiz", callback_data=f"STARTQUIZ|{quiz_id}")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await update.message.reply_text(
+            f"📌 Quiz Name: {quiz_name}\n\nPress the button below to start 👇",
+            reply_markup=reply_markup
+        )
+        return
+
     await update.message.reply_text(
         "👋 Welcome!\n\n"
-        "📌 Send me a DOCX file containing your quiz questions.\n\n"
-        "After that type: /begin"
+        "📌 Send me a DOCX file containing your questions.\n"
+        "Then I will ask you for the Quiz Name.\n\n"
+        "After saving, I will generate a share link 🔗"
     )
 
 
-async def begin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
 
-    if user_id not in user_quiz_data or not user_quiz_data[user_id]["questions"]:
-        await update.message.reply_text("❌ No quiz loaded. Please send a DOCX file first.")
+    doc_file = update.message.document
+
+    if not doc_file.file_name.endswith(".docx"):
+        await update.message.reply_text("❌ Please send a .docx file only.")
         return
 
-    user_quiz_data[user_id]["index"] = 0
-    user_quiz_data[user_id]["score"] = 0
-    user_quiz_data[user_id]["chat_id"] = update.effective_chat.id
+    file = await doc_file.get_file()
+    os.makedirs("downloads", exist_ok=True)
+
+    path = f"downloads/{user_id}_quiz.docx"
+    await file.download_to_drive(path)
+
+    questions = parse_docx(path)
+
+    if not questions:
+        await update.message.reply_text("❌ No valid questions found. Please check formatting.")
+        return
+
+    temp_uploads[user_id] = {
+        "questions": questions,
+        "chat_id": chat_id
+    }
+
+    await update.message.reply_text(
+        f"✅ File received!\n📌 Questions extracted: {len(questions)}\n\n"
+        "📝 Now send me the Quiz Name (example: Chapter 3 - Blood)."
+    )
+
+
+async def handle_quiz_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if user_id not in temp_uploads:
+        return
+
+    quiz_name = update.message.text.strip()
+    questions = temp_uploads[user_id]["questions"]
+
+    quiz_id = "q_" + uuid.uuid4().hex[:8]
+
+    save_quiz_to_db(quiz_id, quiz_name, questions)
+
+    del temp_uploads[user_id]
+
+    link = f"https://t.me/{BOT_USERNAME}?start={quiz_id}"
+
+    await update.message.reply_text(
+        f"🎉 Quiz saved successfully!\n\n"
+        f"📌 Quiz Name: {quiz_name}\n"
+        f"🧾 Questions: {len(questions)}\n\n"
+        f"🔗 Share Link:\n{link}"
+    )
+
+
+async def start_quiz_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    chat_id = query.message.chat_id
+
+    _, quiz_id = query.data.split("|")
+
+    quiz_data = load_quiz_from_db(quiz_id)
+    if not quiz_data:
+        await query.message.reply_text("❌ Quiz not found.")
+        return
+
+    questions = quiz_data["questions"]
+
+    user_sessions[user_id] = {
+        "quiz_id": quiz_id,
+        "index": 0,
+        "score": 0,
+        "chat_id": chat_id,
+        "questions": questions
+    }
+
+    await query.message.reply_text("✅ Starting your quiz now...")
 
     await send_next_question(user_id, context)
 
 
 async def send_next_question(user_id: int, context: ContextTypes.DEFAULT_TYPE):
-    data = user_quiz_data.get(user_id)
-    if not data:
+    session = user_sessions.get(user_id)
+    if not session:
         return
 
-    idx = data["index"]
-    questions = data["questions"]
-    chat_id = data["chat_id"]
+    idx = session["index"]
+    questions = session["questions"]
+    chat_id = session["chat_id"]
 
     if idx >= len(questions):
-        score = data["score"]
+        score = session["score"]
         total = len(questions)
         percent = round((score / total) * 100, 1)
 
@@ -123,6 +287,8 @@ async def send_next_question(user_id: int, context: ContextTypes.DEFAULT_TYPE):
             chat_id=chat_id,
             text=f"🎉 Quiz Finished!\n\n🏆 Score: {score}/{total}\n📊 Percentage: {percent}%"
         )
+
+        del user_sessions[user_id]
         return
 
     q = questions[idx]
@@ -137,58 +303,27 @@ async def send_next_question(user_id: int, context: ContextTypes.DEFAULT_TYPE):
         is_anonymous=False
     )
 
-    data["index"] += 1
-
-
-async def handle_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-
-    doc_file = update.message.document
-    if not doc_file.file_name.endswith(".docx"):
-        await update.message.reply_text("❌ Please send a .docx file only.")
-        return
-
-    file = await doc_file.get_file()
-    os.makedirs("downloads", exist_ok=True)
-
-    path = f"downloads/{user_id}_quiz.docx"
-    await file.download_to_drive(path)
-
-    questions = parse_docx(path)
-
-    if not questions:
-        await update.message.reply_text("❌ Could not find valid questions in the file. Check formatting.")
-        return
-
-    user_quiz_data[user_id] = {
-        "questions": questions,
-        "index": 0,
-        "score": 0,
-        "chat_id": update.effective_chat.id
-    }
-
-    await update.message.reply_text(
-        f"✅ File received!\n📌 Questions loaded: {len(questions)}\n\nType /begin to start the quiz."
-    )
+    session["index"] += 1
 
 
 async def poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.poll_answer.user.id
 
-    data = user_quiz_data.get(user_id)
-    if not data:
+    session = user_sessions.get(user_id)
+    if not session:
         return
 
-    question_index = data["index"] - 1
+    question_index = session["index"] - 1
     if question_index < 0:
         return
 
-    q = data["questions"][question_index]
+    q = session["questions"][question_index]
 
     if update.poll_answer.option_ids:
         chosen = update.poll_answer.option_ids[0]
+
         if chosen == q["correct"]:
-            data["score"] += 1
+            session["score"] += 1
 
     await send_next_question(user_id, context)
 
@@ -198,13 +333,19 @@ def main():
         print("❌ BOT_TOKEN is missing!")
         return
 
+    if not DATABASE_URL:
+        print("❌ DATABASE_URL is missing!")
+        return
+
+    init_db()
+
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("begin", begin))
-
     app.add_handler(MessageHandler(filters.Document.ALL, handle_doc))
-    app.add_handler(PollAnswerHandler(poll_answer))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_quiz_name))
+    app.add_handler(CallbackQueryHandler(start_quiz_button, pattern=r"^STARTQUIZ\|"))
+    app.add_handler(MessageHandler(filters.POLL_ANSWER, poll_answer))
 
     print("Bot is running...")
     app.run_polling()
