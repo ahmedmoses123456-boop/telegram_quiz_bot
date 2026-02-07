@@ -7,19 +7,18 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     ContextTypes,
-    filters
+    filters,
+    PollAnswerHandler
 )
 
 TOKEN = os.getenv("BOT_TOKEN")
 
-# user_id -> {"questions": [], "index": 0, "score": 0, "chat_id": int}
 user_quiz_data = {}
 
 
 def parse_docx(file_path):
     doc = Document(file_path)
 
-    # Collect all non-empty lines from DOCX
     lines = []
     for p in doc.paragraphs:
         text = p.text.strip()
@@ -28,7 +27,6 @@ def parse_docx(file_path):
 
     full_text = "\n".join(lines)
 
-    # Split questions using "---" separator
     blocks = re.split(r"\n\s*---\s*\n", full_text)
 
     questions = []
@@ -57,7 +55,6 @@ def parse_docx(file_path):
         if tf_match:
             options = ["True", "False"]
             correct = 0 if answer_raw.lower() == "true" else 1
-
         else:
             options = []
             for letter in ["A", "B", "C", "D"]:
@@ -70,6 +67,7 @@ def parse_docx(file_path):
 
             correct_letter = answer_raw.upper().strip()
             correct_map = {"A": 0, "B": 1, "C": 2, "D": 3}
+
             if correct_letter not in correct_map:
                 continue
 
@@ -116,7 +114,6 @@ async def send_next_question(user_id: int, context: ContextTypes.DEFAULT_TYPE):
     questions = data["questions"]
     chat_id = data["chat_id"]
 
-    # If finished
     if idx >= len(questions):
         score = data["score"]
         total = len(questions)
@@ -130,7 +127,6 @@ async def send_next_question(user_id: int, context: ContextTypes.DEFAULT_TYPE):
 
     q = questions[idx]
 
-    # Send poll quiz
     await context.bot.send_poll(
         chat_id=chat_id,
         question=f"Q{idx+1}: {q['question']}",
@@ -141,7 +137,6 @@ async def send_next_question(user_id: int, context: ContextTypes.DEFAULT_TYPE):
         is_anonymous=False
     )
 
-    # Move to next question index
     data["index"] += 1
 
 
@@ -184,7 +179,6 @@ async def poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not data:
         return
 
-    # The question user just answered is the previous one
     question_index = data["index"] - 1
     if question_index < 0:
         return
@@ -193,17 +187,15 @@ async def poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if update.poll_answer.option_ids:
         chosen = update.poll_answer.option_ids[0]
-
         if chosen == q["correct"]:
             data["score"] += 1
 
-    # ✅ Automatically send next question
     await send_next_question(user_id, context)
 
 
 def main():
     if not TOKEN:
-        print("❌ BOT_TOKEN is missing! Add it in environment variables.")
+        print("❌ BOT_TOKEN is missing!")
         return
 
     app = Application.builder().token(TOKEN).build()
@@ -212,7 +204,7 @@ def main():
     app.add_handler(CommandHandler("begin", begin))
 
     app.add_handler(MessageHandler(filters.Document.ALL, handle_doc))
-    app.add_handler(MessageHandler(filters.POLL_ANSWER, poll_answer))
+    app.add_handler(PollAnswerHandler(poll_answer))
 
     print("Bot is running...")
     app.run_polling()
