@@ -11,15 +11,20 @@ from telegram.ext import (
     MessageHandler,
     ContextTypes,
     filters,
-    CallbackQueryHandler
+    CallbackQueryHandler,
+    PollAnswerHandler
 )
 
 TOKEN = os.getenv("BOT_TOKEN")
 BOT_USERNAME = "quizerrsbot"
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+# Temporary memory per user (before saving quiz)
 temp_uploads = {}
+
+# Active quiz sessions
 user_sessions = {}
+# user_id -> {"quiz_id": str, "index": int, "score": int, "chat_id": int, "questions": list}
 
 
 # -------------------- DATABASE --------------------
@@ -91,6 +96,7 @@ def parse_docx(file_path):
 
     full_text = "\n".join(lines)
 
+    # split by ---
     blocks = re.split(r"\n\s*---\s*\n", full_text)
 
     questions = []
@@ -153,6 +159,7 @@ def parse_docx(file_path):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
 
+    # If started with a quiz link
     if args:
         quiz_id = args[0].strip()
 
@@ -176,7 +183,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "👋 Welcome!\n\n"
-        "📌 Send me a DOCX file containing your questions.\n"
+        "📌 Send me a DOCX file containing your quiz questions.\n"
         "Then I will ask you for the Quiz Name.\n\n"
         "After saving, I will generate a share link 🔗"
     )
@@ -321,12 +328,13 @@ async def poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if update.poll_answer.option_ids:
         chosen = update.poll_answer.option_ids[0]
-
         if chosen == q["correct"]:
             session["score"] += 1
 
     await send_next_question(user_id, context)
 
+
+# -------------------- MAIN --------------------
 
 def main():
     if not TOKEN:
@@ -342,10 +350,17 @@ def main():
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+
     app.add_handler(MessageHandler(filters.Document.ALL, handle_doc))
+
+    # Quiz name handler (only after upload)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_quiz_name))
+
+    # Start quiz button handler
     app.add_handler(CallbackQueryHandler(start_quiz_button, pattern=r"^STARTQUIZ\|"))
-    app.add_handler(MessageHandler(filters.POLL_ANSWER, poll_answer))
+
+    # Correct handler for poll answers
+    app.add_handler(PollAnswerHandler(poll_answer))
 
     print("Bot is running...")
     app.run_polling()
