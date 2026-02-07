@@ -12,13 +12,23 @@ from telegram.ext import (
 
 TOKEN = os.getenv("BOT_TOKEN")
 
-user_quiz_data = {}  # user_id -> {"questions": [], "index": 0, "score": 0}
+# user_id -> {"questions": [], "index": 0, "score": 0, "chat_id": int}
+user_quiz_data = {}
 
 
 def parse_docx(file_path):
     doc = Document(file_path)
-    full_text = "\n".join([p.text.strip() for p in doc.paragraphs if p.text.strip()])
 
+    # Collect all non-empty lines from DOCX
+    lines = []
+    for p in doc.paragraphs:
+        text = p.text.strip()
+        if text:
+            lines.append(text)
+
+    full_text = "\n".join(lines)
+
+    # Split questions using "---" separator
     blocks = re.split(r"\n\s*---\s*\n", full_text)
 
     questions = []
@@ -62,6 +72,7 @@ def parse_docx(file_path):
             correct_map = {"A": 0, "B": 1, "C": 2, "D": 3}
             if correct_letter not in correct_map:
                 continue
+
             correct = correct_map[correct_letter]
 
         questions.append({
@@ -76,7 +87,9 @@ def parse_docx(file_path):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Welcome!\n\n📌 Send me a DOCX file containing your quiz questions.\n\nAfter that type: /begin"
+        "👋 Welcome!\n\n"
+        "📌 Send me a DOCX file containing your quiz questions.\n\n"
+        "After that type: /begin"
     )
 
 
@@ -89,35 +102,37 @@ async def begin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_quiz_data[user_id]["index"] = 0
     user_quiz_data[user_id]["score"] = 0
+    user_quiz_data[user_id]["chat_id"] = update.effective_chat.id
 
-    await send_next_question(update, context)
+    await send_next_question(user_id, context)
 
 
-async def send_next_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+async def send_next_question(user_id: int, context: ContextTypes.DEFAULT_TYPE):
     data = user_quiz_data.get(user_id)
-
     if not data:
         return
 
     idx = data["index"]
     questions = data["questions"]
+    chat_id = data["chat_id"]
 
+    # If finished
     if idx >= len(questions):
         score = data["score"]
         total = len(questions)
         percent = round((score / total) * 100, 1)
 
         await context.bot.send_message(
-            chat_id=update.effective_chat.id,
+            chat_id=chat_id,
             text=f"🎉 Quiz Finished!\n\n🏆 Score: {score}/{total}\n📊 Percentage: {percent}%"
         )
         return
 
     q = questions[idx]
 
+    # Send poll quiz
     await context.bot.send_poll(
-        chat_id=update.effective_chat.id,
+        chat_id=chat_id,
         question=f"Q{idx+1}: {q['question']}",
         options=q["options"],
         type="quiz",
@@ -126,6 +141,7 @@ async def send_next_question(update: Update, context: ContextTypes.DEFAULT_TYPE)
         is_anonymous=False
     )
 
+    # Move to next question index
     data["index"] += 1
 
 
@@ -149,7 +165,12 @@ async def handle_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Could not find valid questions in the file. Check formatting.")
         return
 
-    user_quiz_data[user_id] = {"questions": questions, "index": 0, "score": 0}
+    user_quiz_data[user_id] = {
+        "questions": questions,
+        "index": 0,
+        "score": 0,
+        "chat_id": update.effective_chat.id
+    }
 
     await update.message.reply_text(
         f"✅ File received!\n📌 Questions loaded: {len(questions)}\n\nType /begin to start the quiz."
@@ -157,24 +178,34 @@ async def handle_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    answer = update.poll_answer
+    user_id = update.poll_answer.user.id
 
     data = user_quiz_data.get(user_id)
     if not data:
         return
 
+    # The question user just answered is the previous one
     question_index = data["index"] - 1
     if question_index < 0:
         return
 
     q = data["questions"][question_index]
 
-    if answer.option_ids and answer.option_ids[0] == q["correct"]:
-        data["score"] += 1
+    if update.poll_answer.option_ids:
+        chosen = update.poll_answer.option_ids[0]
+
+        if chosen == q["correct"]:
+            data["score"] += 1
+
+    # ✅ Automatically send next question
+    await send_next_question(user_id, context)
 
 
 def main():
+    if not TOKEN:
+        print("❌ BOT_TOKEN is missing! Add it in environment variables.")
+        return
+
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
