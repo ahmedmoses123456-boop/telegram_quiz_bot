@@ -19,12 +19,17 @@ TOKEN = os.getenv("BOT_TOKEN")
 BOT_USERNAME = "quizerrsbot"
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Temporary memory per user (before saving quiz)
 temp_uploads = {}
-
-# Active quiz sessions
 user_sessions = {}
-# user_id -> {"quiz_id": str, "index": int, "score": int, "chat_id": int, "questions": list}
+# user_id -> {
+#   "quiz_id": str,
+#   "index": int,
+#   "score": int,
+#   "chat_id": int,
+#   "questions": list,
+#   "waiting_for_timer": bool,
+#   "time_per_question": int
+# }
 
 
 # -------------------- DATABASE --------------------
@@ -83,20 +88,9 @@ def load_quiz_from_db(quiz_id):
     return {"quiz_name": quiz_name, "questions": questions}
 
 
-# -------------------- DOCX PARSER --------------------
+# -------------------- DOCX PARSERS --------------------
 
-def parse_docx(file_path):
-    doc = Document(file_path)
-
-    lines = []
-    for p in doc.paragraphs:
-        text = p.text.strip()
-        if text:
-            lines.append(text)
-
-    full_text = "\n".join(lines)
-
-    # split by ---
+def parse_docx_old_format(full_text: str):
     blocks = re.split(r"\n\s*---\s*\n", full_text)
 
     questions = []
@@ -154,12 +148,129 @@ def parse_docx(file_path):
     return questions
 
 
+def parse_docx_table(doc: Document):
+    """
+    Reads questions from DOCX tables.
+
+    Required columns:
+    Type | Question | A | B | C | D | Correct | Explanation
+
+    Type values:
+    MCQ or TF
+    """
+
+    questions = []
+
+    for table in doc.tables:
+        rows = table.rows
+        if len(rows) < 2:
+            continue
+
+        # Read headers
+        headers = [cell.text.strip().lower() for cell in rows[0].cells]
+
+        required = ["type", "question", "correct", "explanation"]
+        if not all(r in headers for r in required):
+            continue
+
+        def get_cell(row, col_name):
+            if col_name not in headers:
+                return ""
+            idx = headers.index(col_name)
+            if idx >= len(row.cells):
+                return ""
+            return row.cells[idx].text.strip()
+
+        for r in rows[1:]:
+            q_type = get_cell(r, "type").strip().upper()
+            q_text = get_cell(r, "question").strip()
+            correct_val = get_cell(r, "correct").strip()
+            explanation = get_cell(r, "explanation").strip()
+
+            if not q_text:
+                continue
+
+            if not explanation:
+                explanation = "No explanation provided."
+
+            if q_type == "TF":
+                options = ["True", "False"]
+
+                if correct_val.lower() == "true":
+                    correct = 0
+                elif correct_val.lower() == "false":
+                    correct = 1
+                else:
+                    continue
+
+                questions.append({
+                    "question": q_text,
+                    "options": options,
+                    "correct": correct,
+                    "explanation": explanation
+                })
+
+            else:
+                # Default MCQ
+                a = get_cell(r, "a")
+                b = get_cell(r, "b")
+                c = get_cell(r, "c")
+                d = get_cell(r, "d")
+
+                options = [a, b, c, d]
+                options = [opt.strip() for opt in options if opt.strip()]
+
+                if len(options) < 2:
+                    continue
+
+                correct_letter = correct_val.upper().strip()
+                correct_map = {"A": 0, "B": 1, "C": 2, "D": 3}
+
+                if correct_letter not in correct_map:
+                    continue
+
+                correct = correct_map[correct_letter]
+
+                if correct >= len(options):
+                    continue
+
+                questions.append({
+                    "question": q_text,
+                    "options": options,
+                    "correct": correct,
+                    "explanation": explanation
+                })
+
+    return questions
+
+
+def parse_docx(file_path):
+    doc = Document(file_path)
+
+    # 1) Try reading tables first (new method)
+    table_questions = parse_docx_table(doc)
+    if table_questions:
+        return table_questions
+
+    # 2) If no valid tables found, fallback to old text format
+    lines = []
+    for p in doc.paragraphs:
+        text = p.text.strip()
+        if text:
+            lines.append(text)
+
+    full_text = "\n".join(lines)
+
+    old_questions = parse_docx_old_format(full_text)
+    return old_questions
+
+
 # -------------------- BOT HANDLERS --------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
 
-    # If started with a quiz link
+    # Start from quiz link
     if args:
         quiz_id = args[0].strip()
 
@@ -181,11 +292,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Normal start message
     await update.message.reply_text(
-        "👋 Welcome!\n\n"
-        "📌 Send me a DOCX file containing your quiz questions.\n"
-        "Then I will ask you for the Quiz Name.\n\n"
-        "After saving, I will generate a share link 🔗"
+        "Welcome!\n"
+        "Send me a DOCX file containing your quiz questions."
     )
 
 
@@ -208,7 +318,12 @@ async def handle_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     questions = parse_docx(path)
 
     if not questions:
-        await update.message.reply_text("❌ No valid questions found. Please check formatting.")
+        await update.message.reply_text(
+            "❌ No valid questions found.\n\n"
+            "📌 Supported formats:\n"
+            "1) Old format (Q:, A), ANSWER:, EXPLANATION:, ---)\n"
+            "2) DOCX Table format (Type, Question, A, B, C, D, Correct, Explanation)"
+        )
         return
 
     temp_uploads[user_id] = {
@@ -217,34 +332,59 @@ async def handle_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
 
     await update.message.reply_text(
-        f"✅ File received!\n📌 Questions extracted: {len(questions)}\n\n"
-        "📝 Now send me the Quiz Name (example: Chapter 3 - Blood)."
+        f"✅ File received!\nQuestions extracted: {len(questions)}\n\n"
+        "📝 Now send me the Quiz Name."
     )
 
 
-async def handle_quiz_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    text = update.message.text.strip()
 
-    if user_id not in temp_uploads:
+    # ---------------- Timer Step ----------------
+    session = user_sessions.get(user_id)
+    if session and session.get("waiting_for_timer"):
+
+        if not text.isdigit():
+            await update.message.reply_text("❌ Please enter a number between 5 and 600.")
+            return
+
+        seconds = int(text)
+
+        if seconds < 5 or seconds > 600:
+            await update.message.reply_text("❌ Time must be between 5 and 600 seconds.")
+            return
+
+        session["time_per_question"] = seconds
+        session["waiting_for_timer"] = False
+
+        await update.message.reply_text(
+            f"✅ Timer set: {seconds} seconds per question.\nStarting now..."
+        )
+
+        await send_next_question(user_id, context)
         return
 
-    quiz_name = update.message.text.strip()
-    questions = temp_uploads[user_id]["questions"]
+    # ---------------- Quiz Name Step ----------------
+    if user_id in temp_uploads:
+        quiz_name = text
+        questions = temp_uploads[user_id]["questions"]
 
-    quiz_id = "q_" + uuid.uuid4().hex[:8]
+        quiz_id = "q_" + uuid.uuid4().hex[:8]
 
-    save_quiz_to_db(quiz_id, quiz_name, questions)
+        save_quiz_to_db(quiz_id, quiz_name, questions)
 
-    del temp_uploads[user_id]
+        del temp_uploads[user_id]
 
-    link = f"https://t.me/{BOT_USERNAME}?start={quiz_id}"
+        link = f"https://t.me/{BOT_USERNAME}?start={quiz_id}"
 
-    await update.message.reply_text(
-        f"🎉 Quiz saved successfully!\n\n"
-        f"📌 Quiz Name: {quiz_name}\n"
-        f"🧾 Questions: {len(questions)}\n\n"
-        f"🔗 Share Link:\n{link}"
-    )
+        await update.message.reply_text(
+            f"🎉 Quiz saved successfully!\n\n"
+            f"📌 Quiz Name: {quiz_name}\n"
+            f"🧾 Questions: {len(questions)}\n\n"
+            f"🔗 Share Link:\n{link}"
+        )
+        return
 
 
 async def start_quiz_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -268,12 +408,12 @@ async def start_quiz_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "index": 0,
         "score": 0,
         "chat_id": chat_id,
-        "questions": questions
+        "questions": questions,
+        "waiting_for_timer": True,
+        "time_per_question": 30
     }
 
-    await query.message.reply_text("✅ Starting your quiz now...")
-
-    await send_next_question(user_id, context)
+    await query.message.reply_text("⏱️ Enter time per question in seconds (5 - 600):")
 
 
 async def send_next_question(user_id: int, context: ContextTypes.DEFAULT_TYPE):
@@ -284,6 +424,7 @@ async def send_next_question(user_id: int, context: ContextTypes.DEFAULT_TYPE):
     idx = session["index"]
     questions = session["questions"]
     chat_id = session["chat_id"]
+    time_per_question = session.get("time_per_question", 30)
 
     if idx >= len(questions):
         score = session["score"]
@@ -307,7 +448,8 @@ async def send_next_question(user_id: int, context: ContextTypes.DEFAULT_TYPE):
         type="quiz",
         correct_option_id=q["correct"],
         explanation=f"💡 {q['explanation']}",
-        is_anonymous=False
+        is_anonymous=False,
+        open_period=time_per_question
     )
 
     session["index"] += 1
@@ -350,16 +492,12 @@ def main():
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-
     app.add_handler(MessageHandler(filters.Document.ALL, handle_doc))
 
-    # Quiz name handler (only after upload)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_quiz_name))
+    # One text handler for both timer + quiz name
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # Start quiz button handler
     app.add_handler(CallbackQueryHandler(start_quiz_button, pattern=r"^STARTQUIZ\|"))
-
-    # Correct handler for poll answers
     app.add_handler(PollAnswerHandler(poll_answer))
 
     print("Bot is running...")
@@ -368,4 +506,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
