@@ -28,9 +28,7 @@ user_sessions = {}
 #   "index": int,
 #   "score": int,
 #   "chat_id": int,
-#   "questions": list,
-#   "waiting_for_timer": bool,
-#   "time_per_question": int
+#   "questions": list
 # }
 
 
@@ -255,12 +253,10 @@ def parse_docx_table(doc: Document):
 def parse_docx(file_path):
     doc = Document(file_path)
 
-    # 1) Try table method first
     table_questions = parse_docx_table(doc)
     if table_questions:
         return table_questions
 
-    # 2) Fallback to old text method
     lines = []
     for p in doc.paragraphs:
         text = p.text.strip()
@@ -281,7 +277,6 @@ def parse_xlsx(file_path):
 
     questions = []
 
-    # Read header row
     header_row = []
     for cell in sheet[1]:
         header_row.append(normalize_header(cell.value))
@@ -370,7 +365,6 @@ def parse_xlsx(file_path):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
 
-    # Start from quiz link
     if args:
         quiz_id = args[0].strip()
 
@@ -447,31 +441,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text.strip()
 
-    # Timer step
-    session = user_sessions.get(user_id)
-    if session and session.get("waiting_for_timer"):
-
-        if not text.isdigit():
-            await update.message.reply_text("❌ Please enter a number between 5 and 600.")
-            return
-
-        seconds = int(text)
-
-        if seconds < 5 or seconds > 600:
-            await update.message.reply_text("❌ Time must be between 5 and 600 seconds.")
-            return
-
-        session["time_per_question"] = seconds
-        session["waiting_for_timer"] = False
-
-        await update.message.reply_text(
-            f"✅ Timer set: {seconds} seconds per question.\nStarting now..."
-        )
-
-        await send_next_question(user_id, context)
-        return
-
-    # Quiz name step
     if user_id in temp_uploads:
         quiz_name = text
         questions = temp_uploads[user_id]["questions"]
@@ -514,12 +483,11 @@ async def start_quiz_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "index": 0,
         "score": 0,
         "chat_id": chat_id,
-        "questions": questions,
-        "waiting_for_timer": True,
-        "time_per_question": 30
+        "questions": questions
     }
 
-    await query.message.reply_text("⏱️ Enter time per question in seconds (5 - 600):")
+    await query.message.reply_text("✅ Quiz started!")
+    await send_next_question(user_id, context)
 
 
 async def send_next_question(user_id: int, context: ContextTypes.DEFAULT_TYPE):
@@ -530,7 +498,6 @@ async def send_next_question(user_id: int, context: ContextTypes.DEFAULT_TYPE):
     idx = session["index"]
     questions = session["questions"]
     chat_id = session["chat_id"]
-    time_per_question = session.get("time_per_question", 30)
 
     if idx >= len(questions):
         score = session["score"]
@@ -554,8 +521,7 @@ async def send_next_question(user_id: int, context: ContextTypes.DEFAULT_TYPE):
         type="quiz",
         correct_option_id=q["correct"],
         explanation=f"💡 {q['explanation']}",
-        is_anonymous=False,
-        open_period=time_per_question
+        is_anonymous=False
     )
 
     session["index"] += 1
@@ -598,12 +564,8 @@ def main():
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-
-    # accepts both docx and xlsx
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
-
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
     app.add_handler(CallbackQueryHandler(start_quiz_button, pattern=r"^STARTQUIZ\|"))
     app.add_handler(PollAnswerHandler(poll_answer))
 
