@@ -4,6 +4,8 @@ import json
 import uuid
 import psycopg2
 from docx import Document
+import openpyxl
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -88,6 +90,18 @@ def load_quiz_from_db(quiz_id):
     return {"quiz_name": quiz_name, "questions": questions}
 
 
+# -------------------- HELPERS --------------------
+
+def normalize_header(text: str):
+    return str(text).strip().lower()
+
+
+def safe_str(value):
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
 # -------------------- DOCX PARSERS --------------------
 
 def parse_docx_old_format(full_text: str):
@@ -154,9 +168,6 @@ def parse_docx_table(doc: Document):
 
     Required columns:
     Type | Question | A | B | C | D | Correct | Explanation
-
-    Type values:
-    MCQ or TF
     """
 
     questions = []
@@ -166,11 +177,9 @@ def parse_docx_table(doc: Document):
         if len(rows) < 2:
             continue
 
-        # Read headers
-        headers = [cell.text.strip().lower() for cell in rows[0].cells]
+        headers = [normalize_header(cell.text) for cell in rows[0].cells]
 
-        required = ["type", "question", "correct", "explanation"]
-        if not all(r in headers for r in required):
+        if "type" not in headers or "question" not in headers or "correct" not in headers or "explanation" not in headers:
             continue
 
         def get_cell(row, col_name):
@@ -179,13 +188,13 @@ def parse_docx_table(doc: Document):
             idx = headers.index(col_name)
             if idx >= len(row.cells):
                 return ""
-            return row.cells[idx].text.strip()
+            return safe_str(row.cells[idx].text)
 
         for r in rows[1:]:
-            q_type = get_cell(r, "type").strip().upper()
-            q_text = get_cell(r, "question").strip()
-            correct_val = get_cell(r, "correct").strip()
-            explanation = get_cell(r, "explanation").strip()
+            q_type = get_cell(r, "type").upper()
+            q_text = get_cell(r, "question")
+            correct_val = get_cell(r, "correct")
+            explanation = get_cell(r, "explanation")
 
             if not q_text:
                 continue
@@ -211,7 +220,6 @@ def parse_docx_table(doc: Document):
                 })
 
             else:
-                # Default MCQ
                 a = get_cell(r, "a")
                 b = get_cell(r, "b")
                 c = get_cell(r, "c")
@@ -247,12 +255,12 @@ def parse_docx_table(doc: Document):
 def parse_docx(file_path):
     doc = Document(file_path)
 
-    # 1) Try reading tables first (new method)
+    # 1) Try table method first
     table_questions = parse_docx_table(doc)
     if table_questions:
         return table_questions
 
-    # 2) If no valid tables found, fallback to old text format
+    # 2) Fallback to old text method
     lines = []
     for p in doc.paragraphs:
         text = p.text.strip()
@@ -260,9 +268,101 @@ def parse_docx(file_path):
             lines.append(text)
 
     full_text = "\n".join(lines)
-
     old_questions = parse_docx_old_format(full_text)
+
     return old_questions
+
+
+# -------------------- XLSX PARSER --------------------
+
+def parse_xlsx(file_path):
+    wb = openpyxl.load_workbook(file_path)
+    sheet = wb.active
+
+    questions = []
+
+    # Read header row
+    header_row = []
+    for cell in sheet[1]:
+        header_row.append(normalize_header(cell.value))
+
+    required = ["type", "question", "correct", "explanation"]
+    if not all(r in header_row for r in required):
+        return []
+
+    def get_col_index(col_name):
+        return header_row.index(col_name) + 1
+
+    type_col = get_col_index("type")
+    question_col = get_col_index("question")
+    correct_col = get_col_index("correct")
+    explanation_col = get_col_index("explanation")
+
+    a_col = header_row.index("a") + 1 if "a" in header_row else None
+    b_col = header_row.index("b") + 1 if "b" in header_row else None
+    c_col = header_row.index("c") + 1 if "c" in header_row else None
+    d_col = header_row.index("d") + 1 if "d" in header_row else None
+
+    for row in range(2, sheet.max_row + 1):
+        q_type = safe_str(sheet.cell(row=row, column=type_col).value).upper()
+        q_text = safe_str(sheet.cell(row=row, column=question_col).value)
+        correct_val = safe_str(sheet.cell(row=row, column=correct_col).value)
+        explanation = safe_str(sheet.cell(row=row, column=explanation_col).value)
+
+        if not q_text:
+            continue
+
+        if not explanation:
+            explanation = "No explanation provided."
+
+        if q_type == "TF":
+            options = ["True", "False"]
+
+            if correct_val.lower() == "true":
+                correct = 0
+            elif correct_val.lower() == "false":
+                correct = 1
+            else:
+                continue
+
+            questions.append({
+                "question": q_text,
+                "options": options,
+                "correct": correct,
+                "explanation": explanation
+            })
+
+        else:
+            a = safe_str(sheet.cell(row=row, column=a_col).value) if a_col else ""
+            b = safe_str(sheet.cell(row=row, column=b_col).value) if b_col else ""
+            c = safe_str(sheet.cell(row=row, column=c_col).value) if c_col else ""
+            d = safe_str(sheet.cell(row=row, column=d_col).value) if d_col else ""
+
+            options = [a, b, c, d]
+            options = [opt.strip() for opt in options if opt.strip()]
+
+            if len(options) < 2:
+                continue
+
+            correct_letter = correct_val.upper().strip()
+            correct_map = {"A": 0, "B": 1, "C": 2, "D": 3}
+
+            if correct_letter not in correct_map:
+                continue
+
+            correct = correct_map[correct_letter]
+
+            if correct >= len(options):
+                continue
+
+            questions.append({
+                "question": q_text,
+                "options": options,
+                "correct": correct,
+                "explanation": explanation
+            })
+
+    return questions
 
 
 # -------------------- BOT HANDLERS --------------------
@@ -292,37 +392,43 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Normal start message
     await update.message.reply_text(
         "Welcome!\n"
-        "Send me a DOCX file containing your quiz questions."
+        "Send me a DOCX or XLSX file containing your quiz questions."
     )
 
 
-async def handle_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
 
     doc_file = update.message.document
+    filename = doc_file.file_name.lower()
 
-    if not doc_file.file_name.endswith(".docx"):
-        await update.message.reply_text("❌ Please send a .docx file only.")
+    if not (filename.endswith(".docx") or filename.endswith(".xlsx")):
+        await update.message.reply_text("❌ Please send a .docx or .xlsx file only.")
         return
 
     file = await doc_file.get_file()
     os.makedirs("downloads", exist_ok=True)
 
-    path = f"downloads/{user_id}_quiz.docx"
+    path = f"downloads/{user_id}_{filename}"
     await file.download_to_drive(path)
 
-    questions = parse_docx(path)
+    questions = []
+
+    if filename.endswith(".docx"):
+        questions = parse_docx(path)
+    elif filename.endswith(".xlsx"):
+        questions = parse_xlsx(path)
 
     if not questions:
         await update.message.reply_text(
             "❌ No valid questions found.\n\n"
             "📌 Supported formats:\n"
-            "1) Old format (Q:, A), ANSWER:, EXPLANATION:, ---)\n"
-            "2) DOCX Table format (Type, Question, A, B, C, D, Correct, Explanation)"
+            "1) DOCX old format (Q:, A), ANSWER:, EXPLANATION:, ---)\n"
+            "2) DOCX table format (Type, Question, A, B, C, D, Correct, Explanation)\n"
+            "3) XLSX format (same columns as table)"
         )
         return
 
@@ -341,7 +447,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text.strip()
 
-    # ---------------- Timer Step ----------------
+    # Timer step
     session = user_sessions.get(user_id)
     if session and session.get("waiting_for_timer"):
 
@@ -365,7 +471,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_next_question(user_id, context)
         return
 
-    # ---------------- Quiz Name Step ----------------
+    # Quiz name step
     if user_id in temp_uploads:
         quiz_name = text
         questions = temp_uploads[user_id]["questions"]
@@ -492,9 +598,10 @@ def main():
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_doc))
 
-    # One text handler for both timer + quiz name
+    # accepts both docx and xlsx
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
+
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     app.add_handler(CallbackQueryHandler(start_quiz_button, pattern=r"^STARTQUIZ\|"))
