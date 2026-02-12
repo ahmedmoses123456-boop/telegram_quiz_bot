@@ -2,6 +2,8 @@ import os
 import re
 import json
 import uuid
+import time
+import logging
 import psycopg2
 from docx import Document
 import openpyxl
@@ -17,9 +19,13 @@ from telegram.ext import (
     PollAnswerHandler
 )
 
+# -------------------- LOGGING --------------------
+logging.basicConfig(level=logging.INFO)
+
+# -------------------- ENV VARIABLES --------------------
 TOKEN = os.getenv("BOT_TOKEN")
-BOT_USERNAME = "quizerrsbot"
 DATABASE_URL = os.getenv("DATABASE_URL")
+BOT_USERNAME = os.getenv("BOT_USERNAME")  # لازم تحطها في Railway Variables
 
 temp_uploads = {}
 user_sessions = {}
@@ -34,8 +40,18 @@ user_sessions = {}
 
 # -------------------- DATABASE --------------------
 
-def get_db_connection():
-    return psycopg2.connect(DATABASE_URL)
+def get_db_connection(retries=5, delay=2):
+    """
+    Connect to PostgreSQL with retries and timeout to avoid crashes.
+    """
+    for attempt in range(retries):
+        try:
+            return psycopg2.connect(DATABASE_URL, connect_timeout=10)
+        except Exception as e:
+            print(f"❌ DB connection failed (attempt {attempt+1}/{retries}): {e}")
+            time.sleep(delay)
+
+    raise Exception("❌ Could not connect to DB after retries.")
 
 
 def init_db():
@@ -56,36 +72,46 @@ def init_db():
 
 
 def save_quiz_to_db(quiz_id, quiz_name, questions):
-    conn = get_db_connection()
-    cur = conn.cursor()
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
 
-    cur.execute(
-        "INSERT INTO quizzes (quiz_id, quiz_name, questions_json) VALUES (%s, %s, %s)",
-        (quiz_id, quiz_name, json.dumps(questions, ensure_ascii=False))
-    )
+        cur.execute(
+            "INSERT INTO quizzes (quiz_id, quiz_name, questions_json) VALUES (%s, %s, %s)",
+            (quiz_id, quiz_name, json.dumps(questions, ensure_ascii=False))
+        )
 
-    conn.commit()
-    cur.close()
-    conn.close()
+        conn.commit()
+        cur.close()
+        conn.close()
+
+    except Exception as e:
+        print("❌ Failed to save quiz:", e)
+        raise
 
 
 def load_quiz_from_db(quiz_id):
-    conn = get_db_connection()
-    cur = conn.cursor()
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
 
-    cur.execute("SELECT quiz_name, questions_json FROM quizzes WHERE quiz_id = %s", (quiz_id,))
-    row = cur.fetchone()
+        cur.execute("SELECT quiz_name, questions_json FROM quizzes WHERE quiz_id = %s", (quiz_id,))
+        row = cur.fetchone()
 
-    cur.close()
-    conn.close()
+        cur.close()
+        conn.close()
 
-    if not row:
+        if not row:
+            return None
+
+        quiz_name, questions_json = row
+        questions = json.loads(questions_json)
+
+        return {"quiz_name": quiz_name, "questions": questions}
+
+    except Exception as e:
+        print("❌ Failed to load quiz:", e)
         return None
-
-    quiz_name, questions_json = row
-    questions = json.loads(questions_json)
-
-    return {"quiz_name": quiz_name, "questions": questions}
 
 
 # -------------------- HELPERS --------------------
@@ -447,9 +473,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         quiz_id = "q_" + uuid.uuid4().hex[:8]
 
-        save_quiz_to_db(quiz_id, quiz_name, questions)
+        try:
+            save_quiz_to_db(quiz_id, quiz_name, questions)
+        except Exception:
+            await update.message.reply_text("❌ Failed to save quiz. Database problem.")
+            return
 
         del temp_uploads[user_id]
+
+        if not BOT_USERNAME:
+            await update.message.reply_text(
+                "⚠️ Quiz saved but BOT_USERNAME is missing in Railway Variables.\n"
+                f"Quiz ID: {quiz_id}"
+            )
+            return
 
         link = f"https://t.me/{BOT_USERNAME}?start={quiz_id}"
 
@@ -514,15 +551,20 @@ async def send_next_question(user_id: int, context: ContextTypes.DEFAULT_TYPE):
 
     q = questions[idx]
 
-    await context.bot.send_poll(
-        chat_id=chat_id,
-        question=f"Q{idx+1}: {q['question']}",
-        options=q["options"],
-        type="quiz",
-        correct_option_id=q["correct"],
-        explanation=f"💡 {q['explanation']}",
-        is_anonymous=False
-    )
+    try:
+        await context.bot.send_poll(
+            chat_id=chat_id,
+            question=f"Q{idx+1}: {q['question']}",
+            options=q["options"],
+            type="quiz",
+            correct_option_id=q["correct"],
+            explanation=f"💡 {q['explanation']}",
+            is_anonymous=False
+        )
+    except Exception as e:
+        print("❌ Failed to send poll:", e)
+        await context.bot.send_message(chat_id=chat_id, text="❌ Error sending question.")
+        return
 
     session["index"] += 1
 
@@ -559,7 +601,15 @@ def main():
         print("❌ DATABASE_URL is missing!")
         return
 
-    init_db()
+    if not BOT_USERNAME:
+        print("⚠️ BOT_USERNAME is missing! Links will not work correctly.")
+
+    try:
+        init_db()
+        print("✅ Database initialized successfully")
+    except Exception as e:
+        print("⚠️ Database init failed, bot will continue without DB")
+        print(e)
 
     app = Application.builder().token(TOKEN).build()
 
@@ -569,7 +619,7 @@ def main():
     app.add_handler(CallbackQueryHandler(start_quiz_button, pattern=r"^STARTQUIZ\|"))
     app.add_handler(PollAnswerHandler(poll_answer))
 
-    print("Bot is running...")
+    print("✅ Bot is running...")
     app.run_polling()
 
 
