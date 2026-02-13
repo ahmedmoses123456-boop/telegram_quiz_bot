@@ -49,11 +49,6 @@ def init_db():
     )
     """)
 
-    cur.execute("""
-    ALTER TABLE quizzes
-    ADD COLUMN IF NOT EXISTS time_per_question INTEGER DEFAULT 30
-    """)
-
     # results table
     cur.execute("""
     CREATE TABLE IF NOT EXISTS quiz_results (
@@ -68,9 +63,6 @@ def init_db():
         finished_at TIMESTAMP NOT NULL
     )
     """)
-
-    # ensure columns exist for old DB
-    cur.execute("ALTER TABLE quiz_results ADD COLUMN IF NOT EXISTS full_name TEXT")
 
     conn.commit()
     cur.close()
@@ -201,9 +193,6 @@ def is_admin(user_id: int):
 
 
 def shuffle_question_options(question):
-    """
-    Shuffle options (MCQ + TF) while keeping correct answer correct.
-    """
     options = question["options"]
     correct_index = question["correct"]
 
@@ -251,7 +240,6 @@ def parse_docx_old_format(full_text: str):
         if tf_match:
             options = ["True", "False"]
             correct = 0 if answer_raw.lower() == "true" else 1
-
         else:
             options = []
             for letter in ["A", "B", "C", "D"]:
@@ -482,7 +470,7 @@ async def question_timeout(context: ContextTypes.DEFAULT_TYPE):
     if not session:
         return
 
-    # If user didn't answer and still on same question
+    # if user still didn't answer this question
     if session["index"] == expected_index:
         await send_next_question(user_id, context)
 
@@ -514,8 +502,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        "Welcome!\n"
-        "Send me a DOCX or XLSX file containing your quiz questions."
+        "Welcome!\nSend me a DOCX or XLSX file containing your quiz questions."
     )
 
 
@@ -536,7 +523,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await file.download_to_drive(path)
 
     questions = []
-
     if filename.endswith(".docx"):
         questions = parse_docx(path)
     elif filename.endswith(".xlsx"):
@@ -589,6 +575,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             del temp_uploads[user_id]
             del quiz_creation_step[user_id]
 
+            if not BOT_USERNAME:
+                await update.message.reply_text("❌ BOT_USERNAME is missing in Railway Variables.")
+                return
+
             link = f"https://t.me/{BOT_USERNAME}?start={quiz_id}"
 
             await update.message.reply_text(
@@ -628,7 +618,7 @@ async def start_quiz_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "index": 0,
         "score": 0,
         "chat_id": chat_id,
-        "questions": questions,
+        "questions": questions,  # already shuffled
         "time_per_question": time_per_question,
         "started_at": datetime.utcnow(),
         "full_name": query.from_user.full_name
@@ -699,12 +689,15 @@ async def send_next_question(user_id: int, context: ContextTypes.DEFAULT_TYPE):
         open_period=time_per_question
     )
 
+    # increase index after sending poll
     session["index"] += 1
 
+    # schedule timeout job
     context.job_queue.run_once(
         question_timeout,
         when=time_per_question + 1,
-        data={"user_id": user_id, "expected_index": session["index"]}
+        data={"user_id": user_id, "expected_index": session["index"]},
+        name=f"timeout_{user_id}"
     )
 
 
@@ -715,4 +708,110 @@ async def poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not session:
         return
 
-    question_ind
+    # cancel timeout job (user answered)
+    jobs = context.job_queue.get_jobs_by_name
+    # cancel timeout job (user answered)
+    jobs = context.job_queue.get_jobs_by_name(f"timeout_{user_id}")
+    for job in jobs:
+        job.schedule_removal()
+
+    # selected option (user answer)
+    if not update.poll_answer.option_ids:
+        return
+
+    selected_option = update.poll_answer.option_ids[0]
+
+    # current question index is session["index"] - 1
+    q_index = session["index"] - 1
+    if q_index < 0 or q_index >= len(session["questions"]):
+        return
+
+    question = session["questions"][q_index]
+
+    # check if correct
+    if selected_option == question["correct"]:
+        session["score"] += 1
+
+    await send_next_question(user_id, context)
+
+
+async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if not is_admin(user_id):
+        await update.message.reply_text("❌ You are not allowed to use this command.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("❌ Usage: /rank quiz_id")
+        return
+
+    quiz_id = context.args[0].strip()
+
+    rows = get_all_ranks(quiz_id)
+    if not rows:
+        await update.message.reply_text("❌ No results found for this quiz.")
+        return
+
+    msg = f"🏆 Ranking for Quiz: {quiz_id}\n\n"
+    messages = []
+    counter = 1
+
+    for row in rows:
+        full_name, score, total_q, duration, finished_at = row
+
+        if not full_name:
+            full_name = "Unknown"
+
+        line = f"{counter}) {full_name} | {score}/{total_q} | {format_duration(duration)}\n"
+        counter += 1
+
+        # Telegram message limit safety
+        if len(msg) + len(line) > 3500:
+            messages.append(msg)
+            msg = ""
+
+        msg += line
+
+    if msg.strip():
+        messages.append(msg)
+
+    for m in messages:
+        await update.message.reply_text(m)
+
+
+def main():
+    if not TOKEN:
+        print("ERROR: BOT_TOKEN is missing.")
+        return
+
+    if not DATABASE_URL:
+        print("ERROR: DATABASE_URL is missing.")
+        return
+
+    init_db()
+
+    app = Application.builder().token(TOKEN).build()
+
+    # commands
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("rank", rank_command))
+
+    # callback button
+    app.add_handler(CallbackQueryHandler(start_quiz_button, pattern=r"^STARTQUIZ\|"))
+
+    # poll answers
+    app.add_handler(PollAnswerHandler(poll_answer))
+
+    # file upload
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
+
+    # quiz creation text steps
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    print("Bot is running...")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
