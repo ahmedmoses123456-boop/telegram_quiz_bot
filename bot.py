@@ -16,7 +16,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
     CallbackQueryHandler,
-    PollAnswerHandler
+    PollAnswerHandler,
 )
 
 TOKEN = os.getenv("BOT_TOKEN")
@@ -39,7 +39,6 @@ def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
 
-    # quizzes table
     cur.execute("""
     CREATE TABLE IF NOT EXISTS quizzes (
         quiz_id TEXT PRIMARY KEY,
@@ -49,7 +48,6 @@ def init_db():
     )
     """)
 
-    # results table
     cur.execute("""
     CREATE TABLE IF NOT EXISTS quiz_results (
         id SERIAL PRIMARY KEY,
@@ -149,25 +147,6 @@ def get_rank_for_result(quiz_id, score, duration_seconds):
     return rank, total_users
 
 
-def get_all_ranks(quiz_id):
-    conn = get_db_connection()
-    cur = conn.cursor()
-
-    cur.execute("""
-    SELECT full_name, score, total_questions, duration_seconds, finished_at
-    FROM quiz_results
-    WHERE quiz_id = %s
-    ORDER BY score DESC, duration_seconds ASC, finished_at ASC
-    """, (quiz_id,))
-
-    rows = cur.fetchall()
-
-    cur.close()
-    conn.close()
-
-    return rows
-
-
 # -------------------- HELPERS --------------------
 
 def normalize_header(text: str):
@@ -184,12 +163,6 @@ def format_duration(seconds: int):
     minutes = seconds // 60
     sec = seconds % 60
     return f"{minutes}m {sec}s"
-
-
-def is_admin(user_id: int):
-    if not ADMIN_ID:
-        return False
-    return str(user_id) == str(ADMIN_ID)
 
 
 def shuffle_question_options(question):
@@ -213,7 +186,6 @@ def shuffle_question_options(question):
 
 def parse_docx_old_format(full_text: str):
     blocks = re.split(r"\n\s*---\s*\n", full_text)
-
     questions = []
 
     for block in blocks:
@@ -459,18 +431,20 @@ def parse_xlsx(file_path):
     return questions
 
 
-# -------------------- TIMEOUT JOB --------------------
+# -------------------- TIMEOUT --------------------
 
 async def question_timeout(context: ContextTypes.DEFAULT_TYPE):
     data = context.job.data
     user_id = data["user_id"]
-    expected_index = data["expected_index"]
+    poll_id = data["poll_id"]
 
     session = user_sessions.get(user_id)
     if not session:
         return
 
-    if session["index"] == expected_index:
+    # لو المستخدم مجاوبش على السؤال ده
+    if poll_id in session["pending_polls"]:
+        session["pending_polls"].remove(poll_id)
         await send_next_question(user_id, context)
 
 
@@ -619,7 +593,8 @@ async def start_quiz_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "questions": questions,
         "time_per_question": time_per_question,
         "started_at": datetime.utcnow(),
-        "full_name": query.from_user.full_name
+        "full_name": query.from_user.full_name,
+        "pending_polls": set()
     }
 
     await query.message.reply_text("✅ Quiz started!")
@@ -676,7 +651,7 @@ async def send_next_question(user_id: int, context: ContextTypes.DEFAULT_TYPE):
 
     q = questions[idx]
 
-    await context.bot.send_poll(
+    message = await context.bot.send_poll(
         chat_id=chat_id,
         question=f"Q{idx+1}: {q['question']}",
         options=q["options"],
@@ -687,102 +662,72 @@ async def send_next_question(user_id: int, context: ContextTypes.DEFAULT_TYPE):
         open_period=time_per_question
     )
 
-    # remove old jobs
-    old_jobs = context.job_queue.get_jobs_by_name(f"timeout_{user_id}")
-    for job in old_jobs:
-        job.schedule_removal()
+    poll_id = message.poll.id
 
+    session["pending_polls"].add(poll_id)
+
+    # move index forward after sending poll
     session["index"] += 1
 
-    # schedule timeout job correctly
+    # timeout job
     context.job_queue.run_once(
         question_timeout,
         when=time_per_question + 1,
-        data={"user_id": user_id, "expected_index": session["index"]},
-        name=f"timeout_{user_id}"
+        data={"user_id": user_id, "poll_id": poll_id},
+        name=f"timeout_{user_id}_{poll_id}"
     )
 
 
 async def poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    poll_id = update.poll_answer.poll_id
     user_id = update.poll_answer.user.id
+    selected_option_ids = update.poll_answer.option_ids
 
     session = user_sessions.get(user_id)
     if not session:
         return
 
-    # cancel timeout job
-    jobs = context.job_queue.get_jobs_by_name(f"timeout_{user_id}")
-    for job in jobs:
-        job.schedule_removal()
-
-    if not update.poll_answer.option_ids:
+    # لو السؤال ده مش من ضمن pending => ignore
+    if poll_id not in session["pending_polls"]:
         return
 
-    selected_option = update.poll_answer.option_ids[0]
+    session["pending_polls"].remove(poll_id)
 
-    q_index = session["index"] - 1
-    if q_index < 0 or q_index >= len(session["questions"]):
+    # determine question index based on order sent
+    answered_question_index = session["index"] - (len(session["pending_polls"]) + 1)
+
+    if answered_question_index < 0 or answered_question_index >= len(session["questions"]):
         return
 
-    question = session["questions"][q_index]
+    question_data = session["questions"][answered_question_index]
 
-    if selected_option == question["correct"]:
+    correct_index = question_data["correct"]
+
+    if selected_option_ids and selected_option_ids[0] == correct_index:
         session["score"] += 1
 
+    # next question immediately
     await send_next_question(user_id, context)
 
 
-async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+# -------------------- CALLBACK --------------------
 
-    if not is_admin(user_id):
-        await update.message.reply_text("❌ You are not allowed to use this command.")
-        return
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
 
-    if not context.args:
-        await update.message.reply_text("❌ Usage: /rank quiz_id")
-        return
+    if query.data.startswith("STARTQUIZ|"):
+        await start_quiz_button(update, context)
 
-    quiz_id = context.args[0].strip()
 
-    rows = get_all_ranks(quiz_id)
-    if not rows:
-        await update.message.reply_text("❌ No results found for this quiz.")
-        return
-
-    msg = f"🏆 Ranking for Quiz: {quiz_id}\n\n"
-    messages = []
-    counter = 1
-
-    for row in rows:
-        full_name, score, total_q, duration, finished_at = row
-
-        if not full_name:
-            full_name = "Unknown"
-
-        line = f"{counter}) {full_name} | {score}/{total_q} | {format_duration(duration)}\n"
-        counter += 1
-
-        if len(msg) + len(line) > 3500:
-            messages.append(msg)
-            msg = ""
-
-        msg += line
-
-    if msg.strip():
-        messages.append(msg)
-
-    for m in messages:
-        await update.message.reply_text(m)
-
+# -------------------- MAIN --------------------
 
 def main():
     if not TOKEN:
-        print("ERROR: BOT_TOKEN is missing.")
+        print("ERROR: BOT_TOKEN missing!")
         return
 
     if not DATABASE_URL:
-        print("ERROR: DATABASE_URL is missing.")
+        print("ERROR: DATABASE_URL missing!")
         return
 
     init_db()
@@ -790,14 +735,11 @@ def main():
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("rank", rank_command))
-
-    app.add_handler(CallbackQueryHandler(start_quiz_button, pattern=r"^STARTQUIZ\|"))
-
-    app.add_handler(PollAnswerHandler(poll_answer))
-
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    app.add_handler(CallbackQueryHandler(callback_handler))
+    app.add_handler(PollAnswerHandler(poll_answer))
 
     print("Bot is running...")
     app.run_polling()
