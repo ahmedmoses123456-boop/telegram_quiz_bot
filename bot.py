@@ -3,7 +3,6 @@ import re
 import json
 import uuid
 import random
-import time
 import psycopg2
 from docx import Document
 import openpyxl
@@ -22,14 +21,12 @@ from telegram.ext import (
 
 TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
-
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").strip()
+ADMIN_ID = os.getenv("ADMIN_ID", "").strip()
 
 temp_uploads = {}
 user_sessions = {}
-
 quiz_creation_step = {}
-# user_id -> {"step": "waiting_name" or "waiting_timer", "quiz_name": str}
 
 
 # -------------------- DATABASE --------------------
@@ -42,7 +39,7 @@ def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
 
-    # Quizzes table
+    # quizzes table
     cur.execute("""
     CREATE TABLE IF NOT EXISTS quizzes (
         quiz_id TEXT PRIMARY KEY,
@@ -57,12 +54,13 @@ def init_db():
     ADD COLUMN IF NOT EXISTS time_per_question INTEGER DEFAULT 30
     """)
 
-    # Results table
+    # results table
     cur.execute("""
     CREATE TABLE IF NOT EXISTS quiz_results (
         id SERIAL PRIMARY KEY,
         quiz_id TEXT NOT NULL,
         user_id BIGINT NOT NULL,
+        full_name TEXT,
         score INTEGER NOT NULL,
         total_questions INTEGER NOT NULL,
         duration_seconds INTEGER NOT NULL,
@@ -70,6 +68,9 @@ def init_db():
         finished_at TIMESTAMP NOT NULL
     )
     """)
+
+    # ensure columns exist for old DB
+    cur.execute("ALTER TABLE quiz_results ADD COLUMN IF NOT EXISTS full_name TEXT")
 
     conn.commit()
     cur.close()
@@ -116,14 +117,15 @@ def load_quiz_from_db(quiz_id):
     }
 
 
-def save_result(quiz_id, user_id, score, total_questions, duration_seconds, started_at, finished_at):
+def save_result(quiz_id, user_id, full_name, score, total_questions, duration_seconds, started_at, finished_at):
     conn = get_db_connection()
     cur = conn.cursor()
 
     cur.execute("""
-    INSERT INTO quiz_results (quiz_id, user_id, score, total_questions, duration_seconds, started_at, finished_at)
-    VALUES (%s, %s, %s, %s, %s, %s, %s)
-    """, (quiz_id, user_id, score, total_questions, duration_seconds, started_at, finished_at))
+    INSERT INTO quiz_results
+    (quiz_id, user_id, full_name, score, total_questions, duration_seconds, started_at, finished_at)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+    """, (quiz_id, user_id, full_name, score, total_questions, duration_seconds, started_at, finished_at))
 
     conn.commit()
     cur.close()
@@ -131,20 +133,12 @@ def save_result(quiz_id, user_id, score, total_questions, duration_seconds, star
 
 
 def get_rank_for_result(quiz_id, score, duration_seconds):
-    """
-    Rank is based on:
-    1) Higher score is better
-    2) If tie, lower duration is better
-    """
-
     conn = get_db_connection()
     cur = conn.cursor()
 
-    # Count all attempts for this quiz
     cur.execute("SELECT COUNT(*) FROM quiz_results WHERE quiz_id = %s", (quiz_id,))
     total_users = cur.fetchone()[0]
 
-    # Rank = number of results better than this + 1
     cur.execute("""
     SELECT COUNT(*) FROM quiz_results
     WHERE quiz_id = %s
@@ -161,6 +155,25 @@ def get_rank_for_result(quiz_id, score, duration_seconds):
 
     rank = better_count + 1
     return rank, total_users
+
+
+def get_all_ranks(quiz_id):
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+    SELECT full_name, score, total_questions, duration_seconds, finished_at
+    FROM quiz_results
+    WHERE quiz_id = %s
+    ORDER BY score DESC, duration_seconds ASC, finished_at ASC
+    """, (quiz_id,))
+
+    rows = cur.fetchall()
+
+    cur.close()
+    conn.close()
+
+    return rows
 
 
 # -------------------- HELPERS --------------------
@@ -181,7 +194,33 @@ def format_duration(seconds: int):
     return f"{minutes}m {sec}s"
 
 
-# -------------------- DOCX PARSERS --------------------
+def is_admin(user_id: int):
+    if not ADMIN_ID:
+        return False
+    return str(user_id) == str(ADMIN_ID)
+
+
+def shuffle_question_options(question):
+    """
+    Shuffle options (MCQ + TF) while keeping correct answer correct.
+    """
+    options = question["options"]
+    correct_index = question["correct"]
+
+    correct_option = options[correct_index]
+
+    new_options = options.copy()
+    random.shuffle(new_options)
+
+    new_correct_index = new_options.index(correct_option)
+
+    question["options"] = new_options
+    question["correct"] = new_correct_index
+
+    return question
+
+
+# -------------------- PARSERS --------------------
 
 def parse_docx_old_format(full_text: str):
     blocks = re.split(r"\n\s*---\s*\n", full_text)
@@ -343,8 +382,6 @@ def parse_docx(file_path):
     return old_questions
 
 
-# -------------------- XLSX PARSER --------------------
-
 def parse_xlsx(file_path):
     wb = openpyxl.load_workbook(file_path)
     sheet = wb.active
@@ -432,6 +469,22 @@ def parse_xlsx(file_path):
             })
 
     return questions
+
+
+# -------------------- TIMEOUT JOB --------------------
+
+async def question_timeout(context: ContextTypes.DEFAULT_TYPE):
+    data = context.job.data
+    user_id = data["user_id"]
+    expected_index = data["expected_index"]
+
+    session = user_sessions.get(user_id)
+    if not session:
+        return
+
+    # If user didn't answer and still on same question
+    if session["index"] == expected_index:
+        await send_next_question(user_id, context)
 
 
 # -------------------- BOT HANDLERS --------------------
@@ -565,6 +618,9 @@ async def start_quiz_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     questions = quiz_data["questions"].copy()
     random.shuffle(questions)
 
+    # shuffle options too (including TF)
+    questions = [shuffle_question_options(q.copy()) for q in questions]
+
     time_per_question = quiz_data.get("time_per_question", 30)
 
     user_sessions[user_id] = {
@@ -574,7 +630,8 @@ async def start_quiz_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "chat_id": chat_id,
         "questions": questions,
         "time_per_question": time_per_question,
-        "started_at": datetime.utcnow()
+        "started_at": datetime.utcnow(),
+        "full_name": query.from_user.full_name
     }
 
     await query.message.reply_text("✅ Quiz started!")
@@ -605,6 +662,7 @@ async def send_next_question(user_id: int, context: ContextTypes.DEFAULT_TYPE):
         save_result(
             quiz_id=quiz_id,
             user_id=user_id,
+            full_name=session.get("full_name"),
             score=score,
             total_questions=total,
             duration_seconds=duration_seconds,
@@ -643,6 +701,12 @@ async def send_next_question(user_id: int, context: ContextTypes.DEFAULT_TYPE):
 
     session["index"] += 1
 
+    context.job_queue.run_once(
+        question_timeout,
+        when=time_per_question + 1,
+        data={"user_id": user_id, "expected_index": session["index"]}
+    )
+
 
 async def poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.poll_answer.user.id
@@ -651,48 +715,4 @@ async def poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not session:
         return
 
-    question_index = session["index"] - 1
-    if question_index < 0:
-        return
-
-    q = session["questions"][question_index]
-
-    if update.poll_answer.option_ids:
-        chosen = update.poll_answer.option_ids[0]
-        if chosen == q["correct"]:
-            session["score"] += 1
-
-    await send_next_question(user_id, context)
-
-
-# -------------------- MAIN --------------------
-
-def main():
-    if not TOKEN:
-        print("❌ BOT_TOKEN is missing!")
-        return
-
-    if not DATABASE_URL:
-        print("❌ DATABASE_URL is missing!")
-        return
-
-    if not BOT_USERNAME:
-        print("❌ BOT_USERNAME is missing!")
-        return
-
-    init_db()
-
-    app = Application.builder().token(TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_handler(CallbackQueryHandler(start_quiz_button, pattern=r"^STARTQUIZ\|"))
-    app.add_handler(PollAnswerHandler(poll_answer))
-
-    print("Bot is running...")
-    app.run_polling()
-
-
-if __name__ == "__main__":
-    main()
+    question_ind
