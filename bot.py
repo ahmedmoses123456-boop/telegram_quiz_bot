@@ -2,11 +2,12 @@ import os
 import re
 import json
 import uuid
+import random
 import time
-import logging
 import psycopg2
 from docx import Document
 import openpyxl
+from datetime import datetime
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -19,50 +20,54 @@ from telegram.ext import (
     PollAnswerHandler
 )
 
-# -------------------- LOGGING --------------------
-logging.basicConfig(level=logging.INFO)
-
-# -------------------- ENV VARIABLES --------------------
 TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
-BOT_USERNAME = os.getenv("BOT_USERNAME")  # لازم تحطها في Railway Variables
+
+BOT_USERNAME = os.getenv("BOT_USERNAME", "").strip()
 
 temp_uploads = {}
 user_sessions = {}
-# user_id -> {
-#   "quiz_id": str,
-#   "index": int,
-#   "score": int,
-#   "chat_id": int,
-#   "questions": list
-# }
+
+quiz_creation_step = {}
+# user_id -> {"step": "waiting_name" or "waiting_timer", "quiz_name": str}
 
 
 # -------------------- DATABASE --------------------
 
-def get_db_connection(retries=5, delay=2):
-    """
-    Connect to PostgreSQL with retries and timeout to avoid crashes.
-    """
-    for attempt in range(retries):
-        try:
-            return psycopg2.connect(DATABASE_URL, connect_timeout=10)
-        except Exception as e:
-            print(f"❌ DB connection failed (attempt {attempt+1}/{retries}): {e}")
-            time.sleep(delay)
-
-    raise Exception("❌ Could not connect to DB after retries.")
+def get_db_connection():
+    return psycopg2.connect(DATABASE_URL)
 
 
 def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
 
+    # Quizzes table
     cur.execute("""
     CREATE TABLE IF NOT EXISTS quizzes (
         quiz_id TEXT PRIMARY KEY,
         quiz_name TEXT NOT NULL,
-        questions_json TEXT NOT NULL
+        questions_json TEXT NOT NULL,
+        time_per_question INTEGER DEFAULT 30
+    )
+    """)
+
+    cur.execute("""
+    ALTER TABLE quizzes
+    ADD COLUMN IF NOT EXISTS time_per_question INTEGER DEFAULT 30
+    """)
+
+    # Results table
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS quiz_results (
+        id SERIAL PRIMARY KEY,
+        quiz_id TEXT NOT NULL,
+        user_id BIGINT NOT NULL,
+        score INTEGER NOT NULL,
+        total_questions INTEGER NOT NULL,
+        duration_seconds INTEGER NOT NULL,
+        started_at TIMESTAMP NOT NULL,
+        finished_at TIMESTAMP NOT NULL
     )
     """)
 
@@ -71,47 +76,91 @@ def init_db():
     conn.close()
 
 
-def save_quiz_to_db(quiz_id, quiz_name, questions):
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
+def save_quiz_to_db(quiz_id, quiz_name, questions, time_per_question):
+    conn = get_db_connection()
+    cur = conn.cursor()
 
-        cur.execute(
-            "INSERT INTO quizzes (quiz_id, quiz_name, questions_json) VALUES (%s, %s, %s)",
-            (quiz_id, quiz_name, json.dumps(questions, ensure_ascii=False))
-        )
+    cur.execute(
+        "INSERT INTO quizzes (quiz_id, quiz_name, questions_json, time_per_question) VALUES (%s, %s, %s, %s)",
+        (quiz_id, quiz_name, json.dumps(questions, ensure_ascii=False), time_per_question)
+    )
 
-        conn.commit()
-        cur.close()
-        conn.close()
-
-    except Exception as e:
-        print("❌ Failed to save quiz:", e)
-        raise
+    conn.commit()
+    cur.close()
+    conn.close()
 
 
 def load_quiz_from_db(quiz_id):
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
+    conn = get_db_connection()
+    cur = conn.cursor()
 
-        cur.execute("SELECT quiz_name, questions_json FROM quizzes WHERE quiz_id = %s", (quiz_id,))
-        row = cur.fetchone()
+    cur.execute(
+        "SELECT quiz_name, questions_json, time_per_question FROM quizzes WHERE quiz_id = %s",
+        (quiz_id,)
+    )
+    row = cur.fetchone()
 
-        cur.close()
-        conn.close()
+    cur.close()
+    conn.close()
 
-        if not row:
-            return None
-
-        quiz_name, questions_json = row
-        questions = json.loads(questions_json)
-
-        return {"quiz_name": quiz_name, "questions": questions}
-
-    except Exception as e:
-        print("❌ Failed to load quiz:", e)
+    if not row:
         return None
+
+    quiz_name, questions_json, time_per_question = row
+    questions = json.loads(questions_json)
+
+    return {
+        "quiz_name": quiz_name,
+        "questions": questions,
+        "time_per_question": time_per_question
+    }
+
+
+def save_result(quiz_id, user_id, score, total_questions, duration_seconds, started_at, finished_at):
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+    INSERT INTO quiz_results (quiz_id, user_id, score, total_questions, duration_seconds, started_at, finished_at)
+    VALUES (%s, %s, %s, %s, %s, %s, %s)
+    """, (quiz_id, user_id, score, total_questions, duration_seconds, started_at, finished_at))
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def get_rank_for_result(quiz_id, score, duration_seconds):
+    """
+    Rank is based on:
+    1) Higher score is better
+    2) If tie, lower duration is better
+    """
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    # Count all attempts for this quiz
+    cur.execute("SELECT COUNT(*) FROM quiz_results WHERE quiz_id = %s", (quiz_id,))
+    total_users = cur.fetchone()[0]
+
+    # Rank = number of results better than this + 1
+    cur.execute("""
+    SELECT COUNT(*) FROM quiz_results
+    WHERE quiz_id = %s
+    AND (
+        score > %s
+        OR (score = %s AND duration_seconds < %s)
+    )
+    """, (quiz_id, score, score, duration_seconds))
+
+    better_count = cur.fetchone()[0]
+
+    cur.close()
+    conn.close()
+
+    rank = better_count + 1
+    return rank, total_users
 
 
 # -------------------- HELPERS --------------------
@@ -124,6 +173,12 @@ def safe_str(value):
     if value is None:
         return ""
     return str(value).strip()
+
+
+def format_duration(seconds: int):
+    minutes = seconds // 60
+    sec = seconds % 60
+    return f"{minutes}m {sec}s"
 
 
 # -------------------- DOCX PARSERS --------------------
@@ -187,13 +242,6 @@ def parse_docx_old_format(full_text: str):
 
 
 def parse_docx_table(doc: Document):
-    """
-    Reads questions from DOCX tables.
-
-    Required columns:
-    Type | Question | A | B | C | D | Correct | Explanation
-    """
-
     questions = []
 
     for table in doc.tables:
@@ -420,7 +468,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
 
     doc_file = update.message.document
     filename = doc_file.file_name.lower()
@@ -443,19 +490,11 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         questions = parse_xlsx(path)
 
     if not questions:
-        await update.message.reply_text(
-            "❌ No valid questions found.\n\n"
-            "📌 Supported formats:\n"
-            "1) DOCX old format (Q:, A), ANSWER:, EXPLANATION:, ---)\n"
-            "2) DOCX table format (Type, Question, A, B, C, D, Correct, Explanation)\n"
-            "3) XLSX format (same columns as table)"
-        )
+        await update.message.reply_text("❌ No valid questions found.")
         return
 
-    temp_uploads[user_id] = {
-        "questions": questions,
-        "chat_id": chat_id
-    }
+    temp_uploads[user_id] = {"questions": questions}
+    quiz_creation_step[user_id] = {"step": "waiting_name", "quiz_name": ""}
 
     await update.message.reply_text(
         f"✅ File received!\nQuestions extracted: {len(questions)}\n\n"
@@ -467,36 +506,46 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text.strip()
 
-    if user_id in temp_uploads:
-        quiz_name = text
-        questions = temp_uploads[user_id]["questions"]
+    if user_id in quiz_creation_step:
 
-        quiz_id = "q_" + uuid.uuid4().hex[:8]
-
-        try:
-            save_quiz_to_db(quiz_id, quiz_name, questions)
-        except Exception:
-            await update.message.reply_text("❌ Failed to save quiz. Database problem.")
+        if quiz_creation_step[user_id]["step"] == "waiting_name":
+            quiz_creation_step[user_id]["quiz_name"] = text
+            quiz_creation_step[user_id]["step"] = "waiting_timer"
+            await update.message.reply_text("⏱️ Enter time per question in seconds (5 - 600):")
             return
 
-        del temp_uploads[user_id]
+        if quiz_creation_step[user_id]["step"] == "waiting_timer":
 
-        if not BOT_USERNAME:
+            if not text.isdigit():
+                await update.message.reply_text("❌ Please enter a number (example: 30).")
+                return
+
+            seconds = int(text)
+
+            if seconds < 5 or seconds > 600:
+                await update.message.reply_text("❌ Please choose a time between 5 and 600 seconds.")
+                return
+
+            quiz_name = quiz_creation_step[user_id]["quiz_name"]
+            questions = temp_uploads[user_id]["questions"]
+
+            quiz_id = "q_" + uuid.uuid4().hex[:8]
+
+            save_quiz_to_db(quiz_id, quiz_name, questions, seconds)
+
+            del temp_uploads[user_id]
+            del quiz_creation_step[user_id]
+
+            link = f"https://t.me/{BOT_USERNAME}?start={quiz_id}"
+
             await update.message.reply_text(
-                "⚠️ Quiz saved but BOT_USERNAME is missing in Railway Variables.\n"
-                f"Quiz ID: {quiz_id}"
+                f"🎉 Quiz saved successfully!\n\n"
+                f"📌 Quiz Name: {quiz_name}\n"
+                f"⏱️ Time per question: {seconds} seconds\n"
+                f"🧾 Questions: {len(questions)}\n\n"
+                f"🔗 Share Link:\n{link}"
             )
             return
-
-        link = f"https://t.me/{BOT_USERNAME}?start={quiz_id}"
-
-        await update.message.reply_text(
-            f"🎉 Quiz saved successfully!\n\n"
-            f"📌 Quiz Name: {quiz_name}\n"
-            f"🧾 Questions: {len(questions)}\n\n"
-            f"🔗 Share Link:\n{link}"
-        )
-        return
 
 
 async def start_quiz_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -513,14 +562,19 @@ async def start_quiz_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("❌ Quiz not found.")
         return
 
-    questions = quiz_data["questions"]
+    questions = quiz_data["questions"].copy()
+    random.shuffle(questions)
+
+    time_per_question = quiz_data.get("time_per_question", 30)
 
     user_sessions[user_id] = {
         "quiz_id": quiz_id,
         "index": 0,
         "score": 0,
         "chat_id": chat_id,
-        "questions": questions
+        "questions": questions,
+        "time_per_question": time_per_question,
+        "started_at": datetime.utcnow()
     }
 
     await query.message.reply_text("✅ Quiz started!")
@@ -535,15 +589,40 @@ async def send_next_question(user_id: int, context: ContextTypes.DEFAULT_TYPE):
     idx = session["index"]
     questions = session["questions"]
     chat_id = session["chat_id"]
+    time_per_question = session.get("time_per_question", 30)
 
     if idx >= len(questions):
         score = session["score"]
         total = len(questions)
         percent = round((score / total) * 100, 1)
 
+        finished_at = datetime.utcnow()
+        started_at = session["started_at"]
+        duration_seconds = int((finished_at - started_at).total_seconds())
+
+        quiz_id = session["quiz_id"]
+
+        save_result(
+            quiz_id=quiz_id,
+            user_id=user_id,
+            score=score,
+            total_questions=total,
+            duration_seconds=duration_seconds,
+            started_at=started_at,
+            finished_at=finished_at
+        )
+
+        rank, total_users = get_rank_for_result(quiz_id, score, duration_seconds)
+
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"🎉 Quiz Finished!\n\n🏆 Score: {score}/{total}\n📊 Percentage: {percent}%"
+            text=(
+                f"🎉 Quiz Finished!\n\n"
+                f"🏆 Score: {score}/{total}\n"
+                f"📊 Percentage: {percent}%\n"
+                f"⏱️ Duration: {format_duration(duration_seconds)}\n\n"
+                f"🥇 Your Rank: {rank} / {total_users}"
+            )
         )
 
         del user_sessions[user_id]
@@ -551,20 +630,16 @@ async def send_next_question(user_id: int, context: ContextTypes.DEFAULT_TYPE):
 
     q = questions[idx]
 
-    try:
-        await context.bot.send_poll(
-            chat_id=chat_id,
-            question=f"Q{idx+1}: {q['question']}",
-            options=q["options"],
-            type="quiz",
-            correct_option_id=q["correct"],
-            explanation=f"💡 {q['explanation']}",
-            is_anonymous=False
-        )
-    except Exception as e:
-        print("❌ Failed to send poll:", e)
-        await context.bot.send_message(chat_id=chat_id, text="❌ Error sending question.")
-        return
+    await context.bot.send_poll(
+        chat_id=chat_id,
+        question=f"Q{idx+1}: {q['question']}",
+        options=q["options"],
+        type="quiz",
+        correct_option_id=q["correct"],
+        explanation=f"💡 {q['explanation']}",
+        is_anonymous=False,
+        open_period=time_per_question
+    )
 
     session["index"] += 1
 
@@ -602,14 +677,10 @@ def main():
         return
 
     if not BOT_USERNAME:
-        print("⚠️ BOT_USERNAME is missing! Links will not work correctly.")
+        print("❌ BOT_USERNAME is missing!")
+        return
 
-    try:
-        init_db()
-        print("✅ Database initialized successfully")
-    except Exception as e:
-        print("⚠️ Database init failed, bot will continue without DB")
-        print(e)
+    init_db()
 
     app = Application.builder().token(TOKEN).build()
 
@@ -619,7 +690,7 @@ def main():
     app.add_handler(CallbackQueryHandler(start_quiz_button, pattern=r"^STARTQUIZ\|"))
     app.add_handler(PollAnswerHandler(poll_answer))
 
-    print("✅ Bot is running...")
+    print("Bot is running...")
     app.run_polling()
 
 
