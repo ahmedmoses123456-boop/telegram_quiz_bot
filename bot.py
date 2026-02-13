@@ -470,7 +470,6 @@ async def question_timeout(context: ContextTypes.DEFAULT_TYPE):
     if not session:
         return
 
-    # if user still didn't answer this question
     if session["index"] == expected_index:
         await send_next_question(user_id, context)
 
@@ -608,7 +607,6 @@ async def start_quiz_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     questions = quiz_data["questions"].copy()
     random.shuffle(questions)
 
-    # shuffle options too (including TF)
     questions = [shuffle_question_options(q.copy()) for q in questions]
 
     time_per_question = quiz_data.get("time_per_question", 30)
@@ -618,7 +616,7 @@ async def start_quiz_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "index": 0,
         "score": 0,
         "chat_id": chat_id,
-        "questions": questions,  # already shuffled
+        "questions": questions,
         "time_per_question": time_per_question,
         "started_at": datetime.utcnow(),
         "full_name": query.from_user.full_name
@@ -689,10 +687,14 @@ async def send_next_question(user_id: int, context: ContextTypes.DEFAULT_TYPE):
         open_period=time_per_question
     )
 
-    # increase index after sending poll
+    # remove old jobs
+    old_jobs = context.job_queue.get_jobs_by_name(f"timeout_{user_id}")
+    for job in old_jobs:
+        job.schedule_removal()
+
     session["index"] += 1
 
-    # schedule timeout job
+    # schedule timeout job correctly
     context.job_queue.run_once(
         question_timeout,
         when=time_per_question + 1,
@@ -708,27 +710,22 @@ async def poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not session:
         return
 
-    # cancel timeout job (user answered)
-    jobs = context.job_queue.get_jobs_by_name
-    # cancel timeout job (user answered)
+    # cancel timeout job
     jobs = context.job_queue.get_jobs_by_name(f"timeout_{user_id}")
     for job in jobs:
         job.schedule_removal()
 
-    # selected option (user answer)
     if not update.poll_answer.option_ids:
         return
 
     selected_option = update.poll_answer.option_ids[0]
 
-    # current question index is session["index"] - 1
     q_index = session["index"] - 1
     if q_index < 0 or q_index >= len(session["questions"]):
         return
 
     question = session["questions"][q_index]
 
-    # check if correct
     if selected_option == question["correct"]:
         session["score"] += 1
 
@@ -766,7 +763,6 @@ async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         line = f"{counter}) {full_name} | {score}/{total_q} | {format_duration(duration)}\n"
         counter += 1
 
-        # Telegram message limit safety
         if len(msg) + len(line) > 3500:
             messages.append(msg)
             msg = ""
@@ -793,20 +789,14 @@ def main():
 
     app = Application.builder().token(TOKEN).build()
 
-    # commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("rank", rank_command))
 
-    # callback button
     app.add_handler(CallbackQueryHandler(start_quiz_button, pattern=r"^STARTQUIZ\|"))
 
-    # poll answers
     app.add_handler(PollAnswerHandler(poll_answer))
 
-    # file upload
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
-
-    # quiz creation text steps
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     print("Bot is running...")
