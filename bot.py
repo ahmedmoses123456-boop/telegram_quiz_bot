@@ -16,17 +16,15 @@ from telegram.ext import (
     ContextTypes,
     filters,
     CallbackQueryHandler,
-    PollAnswerHandler,
 )
 
 TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").strip()
-ADMIN_ID = os.getenv("ADMIN_ID", "").strip()
 
 temp_uploads = {}
-user_sessions = {}
 quiz_creation_step = {}
+user_sessions = {}
 
 
 # -------------------- DATABASE --------------------
@@ -431,24 +429,7 @@ def parse_xlsx(file_path):
     return questions
 
 
-# -------------------- TIMEOUT --------------------
-
-async def question_timeout(context: ContextTypes.DEFAULT_TYPE):
-    data = context.job.data
-    user_id = data["user_id"]
-    poll_id = data["poll_id"]
-
-    session = user_sessions.get(user_id)
-    if not session:
-        return
-
-    # لو المستخدم مجاوبش على السؤال ده
-    if poll_id in session["pending_polls"]:
-        session["pending_polls"].remove(poll_id)
-        await send_next_question(user_id, context)
-
-
-# -------------------- BOT HANDLERS --------------------
+# -------------------- QUIZ FLOW --------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
@@ -463,25 +444,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         quiz_name = quiz_data["quiz_name"]
 
-        keyboard = [
-            [InlineKeyboardButton("▶️ Start your quiz", callback_data=f"STARTQUIZ|{quiz_id}")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
+        keyboard = [[InlineKeyboardButton("▶️ Start your quiz", callback_data=f"STARTQUIZ|{quiz_id}")]]
         await update.message.reply_text(
             f"📌 Quiz Name: {quiz_name}\n\nPress the button below to start 👇",
-            reply_markup=reply_markup
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return
 
-    await update.message.reply_text(
-        "Welcome!\nSend me a DOCX or XLSX file containing your quiz questions."
-    )
+    await update.message.reply_text("Welcome!\nSend me a DOCX or XLSX file containing your quiz questions.")
 
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-
     doc_file = update.message.document
     filename = doc_file.file_name.lower()
 
@@ -498,7 +472,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     questions = []
     if filename.endswith(".docx"):
         questions = parse_docx(path)
-    elif filename.endswith(".xlsx"):
+    else:
         questions = parse_xlsx(path)
 
     if not questions:
@@ -519,7 +493,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
     if user_id in quiz_creation_step:
-
         if quiz_creation_step[user_id]["step"] == "waiting_name":
             quiz_creation_step[user_id]["quiz_name"] = text
             quiz_creation_step[user_id]["step"] = "waiting_timer"
@@ -527,13 +500,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if quiz_creation_step[user_id]["step"] == "waiting_timer":
-
             if not text.isdigit():
                 await update.message.reply_text("❌ Please enter a number (example: 30).")
                 return
 
             seconds = int(text)
-
             if seconds < 5 or seconds > 600:
                 await update.message.reply_text("❌ Please choose a time between 5 and 600 seconds.")
                 return
@@ -548,10 +519,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             del temp_uploads[user_id]
             del quiz_creation_step[user_id]
 
-            if not BOT_USERNAME:
-                await update.message.reply_text("❌ BOT_USERNAME is missing in Railway Variables.")
-                return
-
             link = f"https://t.me/{BOT_USERNAME}?start={quiz_id}"
 
             await update.message.reply_text(
@@ -561,47 +528,37 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🧾 Questions: {len(questions)}\n\n"
                 f"🔗 Share Link:\n{link}"
             )
-            return
 
 
-async def start_quiz_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    user_id = query.from_user.id
-    chat_id = query.message.chat_id
-
-    _, quiz_id = query.data.split("|")
-
+async def start_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE, quiz_id: str):
     quiz_data = load_quiz_from_db(quiz_id)
     if not quiz_data:
-        await query.message.reply_text("❌ Quiz not found.")
+        await update.callback_query.message.reply_text("❌ Quiz not found.")
         return
 
     questions = quiz_data["questions"].copy()
     random.shuffle(questions)
-
     questions = [shuffle_question_options(q.copy()) for q in questions]
 
-    time_per_question = quiz_data.get("time_per_question", 30)
+    user_id = update.callback_query.from_user.id
+    chat_id = update.callback_query.message.chat_id
 
     user_sessions[user_id] = {
         "quiz_id": quiz_id,
-        "index": 0,
-        "score": 0,
         "chat_id": chat_id,
         "questions": questions,
-        "time_per_question": time_per_question,
+        "index": 0,
+        "score": 0,
+        "time_per_question": quiz_data.get("time_per_question", 30),
         "started_at": datetime.utcnow(),
-        "full_name": query.from_user.full_name,
-        "pending_polls": set()
+        "full_name": update.callback_query.from_user.full_name
     }
 
-    await query.message.reply_text("✅ Quiz started!")
-    await send_next_question(user_id, context)
+    await update.callback_query.message.reply_text("✅ Quiz started!")
+    await send_question(user_id, context)
 
 
-async def send_next_question(user_id: int, context: ContextTypes.DEFAULT_TYPE):
+async def send_question(user_id: int, context: ContextTypes.DEFAULT_TYPE):
     session = user_sessions.get(user_id)
     if not session:
         return
@@ -609,117 +566,148 @@ async def send_next_question(user_id: int, context: ContextTypes.DEFAULT_TYPE):
     idx = session["index"]
     questions = session["questions"]
     chat_id = session["chat_id"]
-    time_per_question = session.get("time_per_question", 30)
 
     if idx >= len(questions):
-        score = session["score"]
-        total = len(questions)
-        percent = round((score / total) * 100, 1)
-
-        finished_at = datetime.utcnow()
-        started_at = session["started_at"]
-        duration_seconds = int((finished_at - started_at).total_seconds())
-
-        quiz_id = session["quiz_id"]
-
-        save_result(
-            quiz_id=quiz_id,
-            user_id=user_id,
-            full_name=session.get("full_name"),
-            score=score,
-            total_questions=total,
-            duration_seconds=duration_seconds,
-            started_at=started_at,
-            finished_at=finished_at
-        )
-
-        rank, total_users = get_rank_for_result(quiz_id, score, duration_seconds)
-
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"🎉 Quiz Finished!\n\n"
-                f"🏆 Score: {score}/{total}\n"
-                f"📊 Percentage: {percent}%\n"
-                f"⏱️ Duration: {format_duration(duration_seconds)}\n\n"
-                f"🥇 Your Rank: {rank} / {total_users}"
-            )
-        )
-
-        del user_sessions[user_id]
+        await finish_quiz(user_id, context)
         return
 
     q = questions[idx]
+    options = q["options"]
 
-    message = await context.bot.send_poll(
+    keyboard = []
+    row = []
+    for i, opt in enumerate(options):
+        row.append(InlineKeyboardButton(opt, callback_data=f"ANSWER|{i}"))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+
+    msg_text = f"📌 Q{idx+1}/{len(questions)}\n\n{q['question']}"
+
+    await context.bot.send_message(
         chat_id=chat_id,
-        question=f"Q{idx+1}: {q['question']}",
-        options=q["options"],
-        type="quiz",
-        correct_option_id=q["correct"],
-        explanation=f"💡 {q['explanation']}",
-        is_anonymous=False,
-        open_period=time_per_question
+        text=msg_text,
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-    poll_id = message.poll.id
+    # timeout
+    old_jobs = context.job_queue.get_jobs_by_name(f"timer_{user_id}")
+    for job in old_jobs:
+        job.schedule_removal()
 
-    session["pending_polls"].add(poll_id)
-
-    # move index forward after sending poll
-    session["index"] += 1
-
-    # timeout job
     context.job_queue.run_once(
-        question_timeout,
-        when=time_per_question + 1,
-        data={"user_id": user_id, "poll_id": poll_id},
-        name=f"timeout_{user_id}_{poll_id}"
+        question_time_expired,
+        when=session["time_per_question"],
+        data={"user_id": user_id, "question_index": idx},
+        name=f"timer_{user_id}"
     )
 
 
-async def poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    poll_id = update.poll_answer.poll_id
-    user_id = update.poll_answer.user.id
-    selected_option_ids = update.poll_answer.option_ids
+async def question_time_expired(context: ContextTypes.DEFAULT_TYPE):
+    user_id = context.job.data["user_id"]
+    question_index = context.job.data["question_index"]
 
     session = user_sessions.get(user_id)
     if not session:
         return
 
-    # لو السؤال ده مش من ضمن pending => ignore
-    if poll_id not in session["pending_polls"]:
+    if session["index"] != question_index:
         return
 
-    session["pending_polls"].remove(poll_id)
+    session["index"] += 1
+    await send_question(user_id, context)
 
-    # determine question index based on order sent
-    answered_question_index = session["index"] - (len(session["pending_polls"]) + 1)
 
-    if answered_question_index < 0 or answered_question_index >= len(session["questions"]):
+async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE, selected_index: int):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    session = user_sessions.get(user_id)
+    if not session:
         return
 
-    question_data = session["questions"][answered_question_index]
+    idx = session["index"]
+    questions = session["questions"]
 
-    correct_index = question_data["correct"]
+    if idx >= len(questions):
+        return
 
-    if selected_option_ids and selected_option_ids[0] == correct_index:
+    q = questions[idx]
+    correct_index = q["correct"]
+
+    if selected_index == correct_index:
         session["score"] += 1
+        result_text = "✅ Correct!"
+    else:
+        result_text = "❌ Wrong!"
 
-    # next question immediately
-    await send_next_question(user_id, context)
+    explanation = q.get("explanation", "No explanation provided.")
+
+    await query.message.reply_text(f"{result_text}\n\n💡 {explanation}")
+
+    session["index"] += 1
+    await send_question(user_id, context)
 
 
-# -------------------- CALLBACK --------------------
+async def finish_quiz(user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    session = user_sessions.get(user_id)
+    if not session:
+        return
+
+    score = session["score"]
+    total = len(session["questions"])
+    percent = round((score / total) * 100, 1)
+
+    finished_at = datetime.utcnow()
+    started_at = session["started_at"]
+    duration_seconds = int((finished_at - started_at).total_seconds())
+
+    quiz_id = session["quiz_id"]
+
+    save_result(
+        quiz_id=quiz_id,
+        user_id=user_id,
+        full_name=session.get("full_name"),
+        score=score,
+        total_questions=total,
+        duration_seconds=duration_seconds,
+        started_at=started_at,
+        finished_at=finished_at
+    )
+
+    rank, total_users = get_rank_for_result(quiz_id, score, duration_seconds)
+
+    await context.bot.send_message(
+        chat_id=session["chat_id"],
+        text=(
+            f"🎉 Quiz Finished!\n\n"
+            f"🏆 Score: {score}/{total}\n"
+            f"📊 Percentage: {percent}%\n"
+            f"⏱️ Duration: {format_duration(duration_seconds)}\n\n"
+            f"🥇 Your Rank: {rank} / {total_users}"
+        )
+    )
+
+    del user_sessions[user_id]
+
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    data = query.data
 
-    if query.data.startswith("STARTQUIZ|"):
-        await start_quiz_button(update, context)
+    if data.startswith("STARTQUIZ|"):
+        quiz_id = data.split("|")[1]
+        await start_quiz(update, context, quiz_id)
+        return
 
+    if data.startswith("ANSWER|"):
+        selected_index = int(data.split("|")[1])
+        await handle_answer(update, context, selected_index)
+        return
 
-# -------------------- MAIN --------------------
 
 def main():
     if not TOKEN:
@@ -730,6 +718,10 @@ def main():
         print("ERROR: DATABASE_URL missing!")
         return
 
+    if not BOT_USERNAME:
+        print("ERROR: BOT_USERNAME missing!")
+        return
+
     init_db()
 
     app = Application.builder().token(TOKEN).build()
@@ -737,9 +729,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
     app.add_handler(CallbackQueryHandler(callback_handler))
-    app.add_handler(PollAnswerHandler(poll_answer))
 
     print("Bot is running...")
     app.run_polling()
