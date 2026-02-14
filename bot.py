@@ -27,12 +27,10 @@ temp_uploads = {}
 quiz_creation_step = {}
 user_sessions = {}
 
-
 # -------------------- DATABASE --------------------
 
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL)
-
 
 def init_db():
     conn = get_db_connection()
@@ -64,7 +62,6 @@ def init_db():
     cur.close()
     conn.close()
 
-
 def save_quiz_to_db(quiz_id, quiz_name, questions, time_per_question):
     conn = get_db_connection()
     cur = conn.cursor()
@@ -77,7 +74,6 @@ def save_quiz_to_db(quiz_id, quiz_name, questions, time_per_question):
     conn.commit()
     cur.close()
     conn.close()
-
 
 def load_quiz_from_db(quiz_id):
     conn = get_db_connection()
@@ -104,7 +100,6 @@ def load_quiz_from_db(quiz_id):
         "time_per_question": time_per_question
     }
 
-
 def save_result(quiz_id, user_id, score, total_questions, duration_seconds, started_at, finished_at):
     conn = get_db_connection()
     cur = conn.cursor()
@@ -118,7 +113,6 @@ def save_result(quiz_id, user_id, score, total_questions, duration_seconds, star
     conn.commit()
     cur.close()
     conn.close()
-
 
 def get_rank_for_result(quiz_id, score, duration_seconds):
     conn = get_db_connection()
@@ -150,25 +144,21 @@ def get_rank_for_result(quiz_id, score, duration_seconds):
 def normalize_header(text: str):
     return str(text).strip().lower()
 
-
 def safe_str(value):
     if value is None:
         return ""
     return str(value).strip()
-
 
 def format_duration(seconds: int):
     minutes = seconds // 60
     sec = seconds % 60
     return f"{minutes}m {sec}s"
 
-
 def shuffle_question_options(question):
     options = question["options"]
     correct_index = question["correct"]
 
     correct_option = options[correct_index]
-
     new_options = options.copy()
     random.shuffle(new_options)
 
@@ -236,7 +226,6 @@ def parse_docx_old_format(full_text: str):
         })
 
     return questions
-
 
 def parse_docx_table(doc: Document):
     questions = []
@@ -320,7 +309,6 @@ def parse_docx_table(doc: Document):
 
     return questions
 
-
 def parse_docx(file_path):
     doc = Document(file_path)
 
@@ -338,7 +326,6 @@ def parse_docx(file_path):
     old_questions = parse_docx_old_format(full_text)
 
     return old_questions
-
 
 def parse_xlsx(file_path):
     wb = openpyxl.load_workbook(file_path)
@@ -439,12 +426,13 @@ async def question_timeout(context: ContextTypes.DEFAULT_TYPE):
     if not session:
         return
 
+    if session.get("paused"):
+        return
+
     if question_index in session["answered"]:
         return
 
     session["answered"].add(question_index)
-
-    # send next question automatically
     await send_next_question(user_id, context)
 
 
@@ -470,10 +458,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await update.message.reply_text(
-        "Welcome!\nSend me a DOCX or XLSX file containing your quiz questions."
-    )
-
+    await update.message.reply_text("Welcome!\nSend me a DOCX or XLSX file containing your quiz questions.")
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -503,7 +488,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ File received!\nQuestions extracted: {len(questions)}\n\n"
         "📝 Now send me the Quiz Name."
     )
-
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -548,7 +532,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🔗 Share Link:\n{link}"
         )
 
-
 async def start_quiz_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -561,11 +544,7 @@ async def start_quiz_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     questions = quiz_data["questions"].copy()
-
-    # shuffle questions order
     random.shuffle(questions)
-
-    # shuffle options order
     questions = [shuffle_question_options(q.copy()) for q in questions]
 
     user_id = query.from_user.id
@@ -580,16 +559,22 @@ async def start_quiz_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "time_per_question": quiz_data.get("time_per_question", 30),
         "started_at": datetime.utcnow(),
         "answered": set(),
-        "poll_to_index": {}
+        "poll_to_index": {},
+        "wrong_questions": [],
+        "paused": False,
+        "mode": "main",
+        "retry_wrong_counter": {}
     }
 
     await query.message.reply_text("✅ Quiz started!")
     await send_next_question(user_id, context)
 
-
 async def send_next_question(user_id: int, context: ContextTypes.DEFAULT_TYPE):
     session = user_sessions.get(user_id)
     if not session:
+        return
+
+    if session.get("paused"):
         return
 
     idx = session["index"]
@@ -617,12 +602,23 @@ async def send_next_question(user_id: int, context: ContextTypes.DEFAULT_TYPE):
     poll_id = message.poll.id
     session["poll_to_index"][poll_id] = idx
 
-    # remove old timer jobs
+    keyboard = [
+        [
+            InlineKeyboardButton("⏸ Pause Quiz", callback_data="PAUSE"),
+            InlineKeyboardButton("🛑 Stop Quiz", callback_data="STOP")
+        ]
+    ]
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="⚙️ Controls:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
     old_jobs = context.job_queue.get_jobs_by_name(f"timeout_{user_id}")
     for job in old_jobs:
         job.schedule_removal()
 
-    # create timeout job for this question
     context.job_queue.run_once(
         question_timeout,
         when=t + 1,
@@ -632,13 +628,15 @@ async def send_next_question(user_id: int, context: ContextTypes.DEFAULT_TYPE):
 
     session["index"] += 1
 
-
 async def poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     poll_id = update.poll_answer.poll_id
     user_id = update.poll_answer.user.id
 
     session = user_sessions.get(user_id)
     if not session:
+        return
+
+    if session.get("paused"):
         return
 
     if poll_id not in session["poll_to_index"]:
@@ -656,15 +654,26 @@ async def poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if selected == correct:
         session["score"] += 1
+    else:
+        session["wrong_questions"].append(session["questions"][idx])
 
-    # cancel timeout job
+        if session["mode"] == "retry":
+            key = session["questions"][idx]["question"]
+            session["retry_wrong_counter"][key] = session["retry_wrong_counter"].get(key, 0) + 1
+            count = session["retry_wrong_counter"][key]
+
+            if count == 1:
+                await context.bot.send_message(session["chat_id"], "خلاص ركز بقى يا Bro 😭")
+            elif count == 2:
+                await context.bot.send_message(session["chat_id"], "أنا بدأت أقلق عليك يا Bro… ركز بجد 😭💔")
+            else:
+                await context.bot.send_message(session["chat_id"], "يا عم انت غلطت في الأسئلة دي ٣ مرات ركز 😭🔥")
+
     old_jobs = context.job_queue.get_jobs_by_name(f"timeout_{user_id}")
     for job in old_jobs:
         job.schedule_removal()
 
-    # send next question immediately
     await send_next_question(user_id, context)
-
 
 async def finish_quiz(user_id: int, context: ContextTypes.DEFAULT_TYPE):
     session = user_sessions.get(user_id)
@@ -681,28 +690,49 @@ async def finish_quiz(user_id: int, context: ContextTypes.DEFAULT_TYPE):
 
     quiz_id = session["quiz_id"]
 
-    save_result(
-        quiz_id=quiz_id,
-        user_id=user_id,
-        score=score,
-        total_questions=total,
-        duration_seconds=duration_seconds,
-        started_at=started_at,
-        finished_at=finished_at
-    )
-
-    rank, total_users = get_rank_for_result(quiz_id, score, duration_seconds)
-
-    await context.bot.send_message(
-        chat_id=session["chat_id"],
-        text=(
-            f"🎉 Quiz Finished!\n\n"
-            f"🏆 Score: {score}/{total}\n"
-            f"📊 Percentage: {percent}%\n"
-            f"⏱️ Duration: {format_duration(duration_seconds)}\n\n"
-            f"🥇 Your Rank: {rank} / {total_users}"
+    if session["mode"] == "main":
+        save_result(
+            quiz_id=quiz_id,
+            user_id=user_id,
+            score=score,
+            total_questions=total,
+            duration_seconds=duration_seconds,
+            started_at=started_at,
+            finished_at=finished_at
         )
-    )
+
+        rank, total_users = get_rank_for_result(quiz_id, score, duration_seconds)
+
+        keyboard = []
+        if session["wrong_questions"]:
+            keyboard = [[InlineKeyboardButton("🔁 Retry Wrong Questions Only", callback_data="RETRY_WRONG")]]
+
+        await context.bot.send_message(
+            chat_id=session["chat_id"],
+            text=(
+                f"🎉 Quiz Finished!\n\n"
+                f"🏆 Score: {score}/{total}\n"
+                f"📊 Percentage: {percent}%\n"
+                f"⏱️ Duration: {format_duration(duration_seconds)}\n\n"
+                f"🥇 Your Rank: {rank} / {total_users}"
+            ),
+            reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None
+        )
+
+    else:
+        # retry mode (no rank, no db save)
+        if len(session["wrong_questions"]) == 0:
+            await context.bot.send_message(session["chat_id"], "عاااش 🔥💪")
+
+        await context.bot.send_message(
+            chat_id=session["chat_id"],
+            text=(
+                f"✅ Retry Finished!\n\n"
+                f"🏆 Score: {score}/{total}\n"
+                f"📊 Percentage: {percent}%\n"
+                f"⏱️ Duration: {format_duration(duration_seconds)}"
+            )
+        )
 
     del user_sessions[user_id]
 
@@ -710,9 +740,74 @@ async def finish_quiz(user_id: int, context: ContextTypes.DEFAULT_TYPE):
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
+    user_id = query.from_user.id
+
+    session = user_sessions.get(user_id)
 
     if data.startswith("STARTQUIZ|"):
         await start_quiz_button(update, context)
+        return
+
+    if data == "PAUSE":
+        await query.answer()
+
+        if session:
+            session["paused"] = True
+
+            # remove timer
+            old_jobs = context.job_queue.get_jobs_by_name(f"timeout_{user_id}")
+            for job in old_jobs:
+                job.schedule_removal()
+
+            keyboard = [[InlineKeyboardButton("▶️ Resume Quiz", callback_data="RESUME")]]
+
+            await query.message.reply_text(
+                "⏸ Quiz Paused.",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        return
+
+    if data == "RESUME":
+        await query.answer()
+
+        if session:
+            session["paused"] = False
+            await query.message.reply_text("▶️ Quiz Resumed!")
+            await send_next_question(user_id, context)
+        return
+
+    if data == "STOP":
+        await query.answer()
+
+        if session:
+            await query.message.reply_text("🛑 Quiz Stopped!")
+            await finish_quiz(user_id, context)
+        return
+
+    if data == "RETRY_WRONG":
+        await query.answer()
+
+        if not session:
+            return
+
+        wrongs = session["wrong_questions"].copy()
+        if not wrongs:
+            await query.message.reply_text("🎉 No wrong questions to retry!")
+            return
+
+        session["questions"] = wrongs
+        session["index"] = 0
+        session["score"] = 0
+        session["answered"] = set()
+        session["poll_to_index"] = {}
+        session["wrong_questions"] = []
+        session["mode"] = "retry"
+        session["retry_wrong_counter"] = {}
+        session["paused"] = False
+
+        await query.message.reply_text("🔁 Starting retry wrong questions only!")
+        await send_next_question(user_id, context)
+        return
 
 
 def main():
