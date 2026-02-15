@@ -696,7 +696,7 @@ async def poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if session.get("paused"):
-    return
+        return
 
     if poll_id not in session["poll_to_index"]:
         return
@@ -944,3 +944,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
