@@ -125,15 +125,38 @@ def save_result(quiz_id, user_id, score, total_questions, duration_seconds, star
     conn.close()
 
 
+def has_user_completed_quiz_before(quiz_id, user_id):
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+    SELECT 1 FROM quiz_results
+    WHERE quiz_id = %s AND user_id = %s AND is_completed = TRUE
+    LIMIT 1
+    """, (quiz_id, user_id))
+
+    exists = cur.fetchone() is not None
+
+    cur.close()
+    conn.close()
+
+    return exists
+
+
 def get_rank_for_result(quiz_id, score, duration_seconds):
     conn = get_db_connection()
     cur = conn.cursor()
 
-    cur.execute("SELECT COUNT(*) FROM quiz_results WHERE quiz_id = %s AND is_completed = TRUE", (quiz_id,))
+    cur.execute("""
+    SELECT COUNT(DISTINCT user_id)
+    FROM quiz_results
+    WHERE quiz_id = %s AND is_completed = TRUE
+    """, (quiz_id,))
     total_users = cur.fetchone()[0]
 
     cur.execute("""
-    SELECT COUNT(*) FROM quiz_results
+    SELECT COUNT(DISTINCT user_id)
+    FROM quiz_results
     WHERE quiz_id = %s
     AND is_completed = TRUE
     AND (
@@ -473,28 +496,13 @@ async def question_timeout(context: ContextTypes.DEFAULT_TYPE):
     if session.get("paused") or session.get("finished"):
         return
 
-    # لو السؤال اتغير خلاص متعملش حاجة
     if session.get("current_index") != question_index:
         return
 
-    # لو اتجاوب خلاص
     if question_index in session["answered"]:
         return
 
     session["answered"].add(question_index)
-
-    # Retry messages
-    if session.get("mode") == "retry":
-        q_text = session["questions"][question_index]["question"]
-        session["retry_wrong_counter"][q_text] = session["retry_wrong_counter"].get(q_text, 0) + 1
-        count = session["retry_wrong_counter"][q_text]
-
-        if count == 1:
-            await context.bot.send_message(session["chat_id"], "خلاص ركز بقى يا Bro 😭")
-        elif count == 2:
-            await context.bot.send_message(session["chat_id"], "أنا بدأت أقلق عليك يا Bro… ركز بجد 😭💔")
-        else:
-            await context.bot.send_message(session["chat_id"], "يا عم انت غلطت في الأسئلة دي ٣ مرات ركز 😭🔥")
 
     await send_question(user_id, context)
 
@@ -507,7 +515,6 @@ async def send_question(user_id: int, context: ContextTypes.DEFAULT_TYPE):
     if session.get("paused") or session.get("finished"):
         return
 
-    # حماية من ارسال السؤال مرتين
     if session.get("sending"):
         return
 
@@ -546,12 +553,10 @@ async def send_question(user_id: int, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=get_controls_keyboard(paused=False)
         )
 
-        # حذف التايمر القديم
         old_jobs = context.job_queue.get_jobs_by_name(f"timeout_{user_id}")
         for job in old_jobs:
             job.schedule_removal()
 
-        # تايمر جديد
         context.job_queue.run_once(
             question_timeout,
             when=t + 1,
@@ -594,21 +599,7 @@ async def poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         session["wrong_questions"].append(session["questions"][idx])
 
-        # retry message counter
-        if session.get("mode") == "retry":
-            q_text = session["questions"][idx]["question"]
-            session["retry_wrong_counter"][q_text] = session["retry_wrong_counter"].get(q_text, 0) + 1
-            count = session["retry_wrong_counter"][q_text]
-
-            if count == 1:
-                await context.bot.send_message(session["chat_id"], "خلاص ركز بقى يا Bro 😭")
-            elif count == 2:
-                await context.bot.send_message(session["chat_id"], "أنا بدأت أقلق عليك يا Bro… ركز بجد 😭💔")
-            else:
-                await context.bot.send_message(session["chat_id"], "يا عم انت غلطت في الأسئلة دي ٣ مرات ركز 😭🔥")
-
-    await send_question(user_id, context)
-
+    await send_question(user_id, context)# ===================== FINISH QUIZ =====================
 
 async def finish_quiz(user_id: int, context: ContextTypes.DEFAULT_TYPE, stopped=False):
     session = user_sessions.get(user_id)
@@ -634,35 +625,153 @@ async def finish_quiz(user_id: int, context: ContextTypes.DEFAULT_TYPE, stopped=
     percent = (score / total) * 100 if total > 0 else 0
 
     rank_text = ""
+
+    # ✅ Rank يتحسب مرة واحدة فقط (اول محاولة في الامتحان الاساسي)
     if session.get("mode") == "main":
-        save_result(quiz_id, user_id, score, total, duration, started_at, finished_at, is_completed=True)
+        already_done = has_user_completed_quiz_before(quiz_id, user_id)
+
+        if not already_done:
+            save_result(quiz_id, user_id, score, total, duration, started_at, finished_at, is_completed=True)
+
+        # الرانك دايما بيتحسب من اول نتيجة بس (لان احنا بنستخدم DISTINCT user_id)
         rank, total_users = get_rank_for_result(quiz_id, score, duration)
         rank_text = f"\n🥇 Your Rank: {rank} / {total_users}"
 
     extra = ""
+
+    # Perfect score main
     if session.get("mode") == "main" and score == total:
         extra = "\n\n🔥 Perfect Score! عاااش يا وحش 😎💯"
 
+    # Retry end message only (مش بعد كل سؤال)
     if session.get("mode") == "retry":
         if score == total:
             extra = "\n\n🔥 عاااش يا برو 😎💪"
         else:
-            extra = "\n\n😅 شد حيلك يا برو… لسه في غلطات!"
+            extra = "\n\n❌ خلاص ركز بقى يا Bro 😭"
+
+    text = (
+        "🎉 Quiz Finished!\n\n"
+        f"🏆 Score: {score}/{total}\n"
+        f"📊 Percentage: {percent:.1f}%\n"
+        f"⏱ Duration: {format_duration(duration)}"
+        f"{rank_text}"
+        f"{extra}"
+    )
+
+    # ✅ retry button يظهر دايما طالما فيه غلطات (في main او retry)
+    has_wrong = len(session["wrong_questions"]) > 0
+
+    reply_markup = None
+    if has_wrong:
+        reply_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔁 Retry Wrong Questions", callback_data="RETRY_WRONG")]
+        ])
 
     await context.bot.send_message(
         chat_id=session["chat_id"],
-        text=(
-            "🎉 Quiz Finished!\n\n"
-            f"🏆 Score: {score}/{total}\n"
-            f"📊 Percentage: {percent:.1f}%\n"
-            f"⏱ Duration: {format_duration(duration)}"
-            f"{rank_text}"
-            f"{extra}"
-        ),
-        reply_markup=get_finish_keyboard(
-            has_wrong_questions=(len(session["wrong_questions"]) > 0 and session.get("mode") == "main")
-        )
+        text=text,
+        reply_markup=reply_markup
     )
+
+
+# ===================== BUTTON HANDLERS =====================
+
+async def handle_controls(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    session = user_sessions.get(user_id)
+
+    if not session:
+        await query.message.reply_text("❌ No active quiz session.")
+        return
+
+    data = query.data
+
+    if data == "PAUSE":
+        session["paused"] = True
+        await query.message.reply_text("⏸ Quiz Paused.", reply_markup=get_controls_keyboard(paused=True))
+
+    elif data == "RESUME":
+        session["paused"] = False
+        await query.message.reply_text("▶️ Quiz Resumed.", reply_markup=get_controls_keyboard(paused=False))
+
+        # لو كان واقف في نص سؤال ابعت السؤال اللي بعده
+        await send_question(user_id, context)
+
+    elif data == "STOP":
+        await query.message.reply_text("🛑 Quiz Stopped!")
+        await finish_quiz(user_id, context, stopped=True)
+
+    elif data == "RETRY_WRONG":
+        wrongs = session.get("wrong_questions", [])
+
+        if not wrongs:
+            await query.message.reply_text("✅ No wrong questions left 😎🔥")
+            return
+
+        # Reset session for retry
+        session["questions"] = wrongs.copy()
+        random.shuffle(session["questions"])
+        session["questions"] = [shuffle_question_options(q.copy()) for q in session["questions"]]
+
+        session["index"] = 0
+        session["current_index"] = -1
+        session["score"] = 0
+        session["answered"] = set()
+        session["poll_to_index"] = {}
+        session["wrong_questions"] = []
+        session["paused"] = False
+        session["finished"] = False
+        session["mode"] = "retry"
+        session["started_at"] = datetime.utcnow()
+
+        await query.message.reply_text("🔁 Retry started! Let's go 😎🔥")
+        await send_question(user_id, context)
+
+
+# ===================== START QUIZ =====================
+
+async def start_quiz_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    quiz_id = query.data.split("|")[1]
+
+    quiz_data = load_quiz_from_db(quiz_id)
+    if not quiz_data:
+        await query.message.reply_text("❌ Quiz not found.")
+        return
+
+    questions = quiz_data["questions"].copy()
+    random.shuffle(questions)
+    questions = [shuffle_question_options(q.copy()) for q in questions]
+
+    user_id = query.from_user.id
+    chat_id = query.message.chat_id
+
+    user_sessions[user_id] = {
+        "quiz_id": quiz_id,
+        "chat_id": chat_id,
+        "questions": questions,
+        "index": 0,
+        "current_index": -1,
+        "score": 0,
+        "time_per_question": quiz_data.get("time_per_question", 30),
+        "started_at": datetime.utcnow(),
+        "answered": set(),
+        "poll_to_index": {},
+        "wrong_questions": [],
+        "paused": False,
+        "mode": "main",
+        "finished": False,
+        "sending": False
+    }
+
+    await query.message.reply_text("✅ Quiz started!")
+    await send_question(user_id, context)
 
 
 # ===================== COMMANDS =====================
@@ -764,121 +873,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-# ===================== BUTTON HANDLERS =====================
-
-async def start_quiz_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    quiz_id = query.data.split("|")[1]
-
-    quiz_data = load_quiz_from_db(quiz_id)
-    if not quiz_data:
-        await query.message.reply_text("❌ Quiz not found.")
-        return
-
-    questions = quiz_data["questions"].copy()
-    random.shuffle(questions)
-    questions = [shuffle_question_options(q.copy()) for q in questions]
-
-    user_id = query.from_user.id
-    chat_id = query.message.chat_id
-
-    user_sessions[user_id] = {
-        "quiz_id": quiz_id,
-        "chat_id": chat_id,
-        "questions": questions,
-        "index": 0,
-        "current_index": -1,
-        "score": 0,
-        "time_per_question": quiz_data.get("time_per_question", 30),
-        "started_at": datetime.utcnow(),
-        "answered": set(),
-        "poll_to_index": {},
-        "wrong_questions": [],
-        "paused": False,
-        "mode": "main",
-        "retry_wrong_counter": {},
-        "finished": False,
-        "sending": False
-    }
-
-    await query.message.reply_text("✅ Quiz started!")
-    await send_question(user_id, context)
-
-
-async def pause_resume_stop_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    user_id = query.from_user.id
-    session = user_sessions.get(user_id)
-
-    if not session:
-        await query.message.reply_text("❌ No active session found.")
-        return
-
-    if query.data == "PAUSE":
-        session["paused"] = True
-        await query.message.reply_text("⏸ Quiz Paused.", reply_markup=get_controls_keyboard(paused=True))
-
-    elif query.data == "RESUME":
-        session["paused"] = False
-        await query.message.reply_text("▶️ Quiz Resumed!")
-        await send_question(user_id, context)
-
-    elif query.data == "STOP":
-        await query.message.reply_text("🛑 Quiz Stopped.")
-        await finish_quiz(user_id, context, stopped=True)
-
-
-async def retry_wrong_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    user_id = query.from_user.id
-    old_session = user_sessions.get(user_id)
-
-    if not old_session:
-        await query.message.reply_text("❌ No active session found.")
-        return
-
-    wrong_questions = old_session.get("wrong_questions", [])
-    if not wrong_questions:
-        await query.message.reply_text("✅ No wrong questions to retry.")
-        return
-
-    quiz_id = old_session["quiz_id"]
-    chat_id = old_session["chat_id"]
-    time_per_question = old_session["time_per_question"]
-
-    questions = wrong_questions.copy()
-    random.shuffle(questions)
-    questions = [shuffle_question_options(q.copy()) for q in questions]
-
-    user_sessions[user_id] = {
-        "quiz_id": quiz_id,
-        "chat_id": chat_id,
-        "questions": questions,
-        "index": 0,
-        "current_index": -1,
-        "score": 0,
-        "time_per_question": time_per_question,
-        "started_at": datetime.utcnow(),
-        "answered": set(),
-        "poll_to_index": {},
-        "wrong_questions": [],
-        "paused": False,
-        "mode": "retry",
-        "retry_wrong_counter": old_session.get("retry_wrong_counter", {}),
-        "finished": False,
-        "sending": False
-    }
-
-    await query.message.reply_text("🔁 Retry Mode Started! 🔥")
-    await send_question(user_id, context)
-
-
 # ===================== MAIN =====================
 
 def main():
@@ -891,8 +885,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     app.add_handler(CallbackQueryHandler(start_quiz_button, pattern=r"^STARTQUIZ\|"))
-    app.add_handler(CallbackQueryHandler(retry_wrong_handler, pattern=r"^RETRY_WRONG$"))
-    app.add_handler(CallbackQueryHandler(pause_resume_stop_handler, pattern=r"^(PAUSE|RESUME|STOP)$"))
+    app.add_handler(CallbackQueryHandler(handle_controls, pattern=r"^(PAUSE|RESUME|STOP|RETRY_WRONG)$"))
 
     app.add_handler(PollAnswerHandler(poll_answer))
 
